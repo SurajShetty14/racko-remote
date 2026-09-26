@@ -69,5 +69,5 @@ jobs:
           npm ci
           npm run build
 
-      - name: Deploy
+      - name: Deploy to /opt/racko and /var/www/racko-remote
         run: bash scripts/deploy.sh

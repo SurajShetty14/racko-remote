@@ -1,55 +1,101 @@
 # Racko CI/CD
 
-Pushes and pull requests to `main` run `.github/workflows/ci.yml` on GitHub-hosted Ubuntu. A successful **push** to `main` then runs `.github/workflows/deploy.yml` on the self-hosted runner labeled `racko-deploy`. The runner checks out that commit, builds the broker and the frontend on the box, and `scripts/deploy.sh` installs them.
+Pushes and pull requests to `main` run [`.github/workflows/ci.yml`](.github/workflows/ci.yml) on GitHub-hosted Ubuntu.
+A successful **push** to `main` then runs [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) on the self-hosted runner labeled `racko-deploy`.
+That job checks out the commit, builds the broker and frontend on the box, and [`scripts/deploy.sh`](../scripts/deploy.sh) installs them into the canonical layout below.
 
-The IronRDP workflow that used to live in `ci.yml` is now `.github/workflows/ironrdp-ci.yml` (`IronRDP CI`). It still runs on `master`.
+The IronRDP workflow is [`.github/workflows/ironrdp-ci.yml`](.github/workflows/ironrdp-ci.yml) (`IronRDP CI`) and still runs on `master`.
 
-No production URLs or tokens are stored in the repo. Vite reads them from the GitHub Actions secrets at deploy time.
+No production URLs or tokens are stored in the repo.
+Vite reads them from GitHub Actions secrets at deploy time.
 
-## Self-hosted runner
+## Canonical layout
 
-On the Ubuntu box, as the user that should own the deploy (below, `racko`):
+| Path | Purpose |
+| --- | --- |
+| `/opt/racko/broker` | Broker binary (deployed each release) |
+| `/opt/racko/broker.prev` | Previous binary for health-check rollback |
+| `/opt/racko/broker.env` | Broker environment (created once on the box, **not** in git, `chmod 600`) |
+| `/var/www/racko-remote/` | Frontend static files (nginx document root) |
 
-1. Install the GitHub Actions runner from the repo's **Settings → Actions → Runners → New self-hosted runner**, using the Linux x64 instructions GitHub shows there.
-2. When `config.sh` asks for labels, set `self-hosted,racko-deploy`. `self-hosted` is added automatically; add `racko-deploy`.
-3. Install and start it as a service (`sudo ./svc.sh install racko` then `sudo ./svc.sh start`) so it survives reboot.
+Broker listen addresses (set in `broker.env`):
 
-The deploy job is `runs-on: [self-hosted, racko-deploy]`, so an unlabeled runner will not pick it up.
+- Relay (browser WebSocket): `BIND_ADDR=0.0.0.0:7171`
+- Management / health / metrics: `MANAGEMENT_ADDR=127.0.0.1:9091`
 
-The runner user must be able to write these paths without sudo:
+nginx serves `/` from `/var/www/racko-remote` and proxies `/ws` and `/api/` to the broker.
 
-- `/opt/racko` — installed broker binary (`/opt/racko/broker`) and the rollback copy (`/opt/racko/broker.prev`)
-- `/var/www/racko-remote` — nginx document root for the frontend
+## One-time bootstrap
+
+Run as root (or with sudo) on the Ubuntu box.
+Replace `gisuladmin` if the deploy user differs.
+
+### Directories and ownership
 
 ```bash
 sudo mkdir -p /opt/racko /var/www/racko-remote
-sudo chown -R racko:racko /opt/racko /var/www/racko-remote
+sudo chown -R gisuladmin:gisuladmin /opt/racko /var/www/racko-remote
 ```
 
-`racko-broker.service` must start that binary. Example:
+The runner user must write those paths without sudo.
+`scripts/deploy.sh` only uses sudo for `systemctl` and `nginx`.
 
-```ini
-[Service]
-ExecStart=/opt/racko/broker
-EnvironmentFile=/opt/racko/broker.env
-Restart=on-failure
+### `/opt/racko/broker.env`
+
+Create once on the box (never commit this file):
+
+```bash
+sudo tee /opt/racko/broker.env >/dev/null <<'EOF'
+BIND_ADDR=0.0.0.0:7171
+MANAGEMENT_ADDR=127.0.0.1:9091
+RDP_TARGET=203.0.113.10:3389
+RDP_USERNAME=Administrator
+RDP_PASSWORD=change-me
+RDP_TLS_VERIFY=insecure
+IDLE_TIMEOUT_SECS=900
+EOF
+sudo chown gisuladmin:gisuladmin /opt/racko/broker.env
+sudo chmod 600 /opt/racko/broker.env
 ```
 
-`/opt/racko/broker.env` is created on the box (it is not in git). Point `MANAGEMENT_ADDR` at `127.0.0.1:9091` so the deploy health check can reach `/healthz`. The public site is nginx: `/` serves `/var/www/racko-remote`, and `/ws` and `/api/` proxy to the broker.
+Edit `RDP_TARGET` and credentials for the lab VM.
+`MANAGEMENT_ADDR` must stay on `127.0.0.1:9091` so deploy health checks can reach `/healthz`.
 
-## sudoers
+### systemd unit
 
-The runner may restart the broker and reload nginx, and nothing else. As root:
+```bash
+sudo cp deploy/racko-broker.service /etc/systemd/system/racko-broker.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now racko-broker
+```
+
+The unit template is [`deploy/racko-broker.service`](../deploy/racko-broker.service):
+`ExecStart=/opt/racko/broker`, `EnvironmentFile=/opt/racko/broker.env`, `WorkingDirectory=/opt/racko`, `User=gisuladmin`, `LimitNOFILE=1048576`.
+
+### sudoers
+
+Allow only the three deploy commands, with those exact paths:
 
 ```bash
 sudo visudo -f /etc/sudoers.d/racko-deploy
 ```
 
 ```
-racko ALL=(root) NOPASSWD: /usr/bin/systemctl restart racko-broker, /usr/sbin/nginx -t, /usr/bin/systemctl reload nginx
+gisuladmin ALL=(root) NOPASSWD: /usr/bin/systemctl restart racko-broker, /usr/sbin/nginx -t, /usr/bin/systemctl reload nginx
 ```
 
-`scripts/deploy.sh` calls those three commands with those exact paths. A password prompt fails the deploy.
+A password prompt fails the deploy job.
+
+## Self-hosted runner
+
+Install as `gisuladmin` on the Ubuntu box:
+
+1. Open the repo **Settings → Actions → Runners → New self-hosted runner** and follow the Linux x64 steps GitHub shows.
+2. When `config.sh` asks for labels, set `self-hosted,racko-deploy` (`self-hosted` is added automatically; add `racko-deploy`).
+3. Install and start it as a service so it survives reboot: `sudo ./svc.sh install gisuladmin` then `sudo ./svc.sh start`.
+
+The deploy job is `runs-on: [self-hosted, racko-deploy]`.
+An unlabeled runner will not pick it up.
 
 ## GitHub secrets
 
@@ -60,14 +106,24 @@ In the repo, open **Settings → Environments → New environment**, name it `pr
 | `VITE_GATEWAY_URL` | `wss://<domain>/ws` | WebSocket the browser opens |
 | `VITE_BROKER_API_BASE` | `https://<domain>/api` | Dashboard session API |
 
-The same two names work as repository secrets if you prefer not to use an environment. The deploy job declares `environment: production`, so environment secrets take precedence. The deploy step refuses to build the frontend when either value is empty. Do not commit them.
+The deploy job sets `environment: production` and passes both secrets into the `racko-remote` Vite build, then refuses to continue if either is empty.
+Do not commit them.
 
 ## What a deploy does
 
-`scripts/deploy.sh` is safe to run again:
+[`scripts/deploy.sh`](../scripts/deploy.sh) runs from the runner workspace after the release builds finish:
 
-1. Copies the current `/opt/racko/broker` to `/opt/racko/broker.prev` when one is already installed.
-2. Installs `target/release/broker` and runs `systemctl restart racko-broker`.
-3. `rsync --delete`s `web-client/racko-remote/dist/` onto `/var/www/racko-remote`.
-4. Runs `nginx -t` and, only if that succeeds, `systemctl reload nginx`.
-5. `curl -f http://127.0.0.1:9091/healthz`. On failure it copies `broker.prev` back, restarts `racko-broker`, and exits non-zero. To revert by hand: `install -m 0755 /opt/racko/broker.prev /opt/racko/broker && sudo systemctl restart racko-broker`.
+1. Backs up `/opt/racko/broker` to `/opt/racko/broker.prev` when a binary is already installed.
+2. Copies `target/release/broker` to `/opt/racko/broker`.
+3. `rsync --delete`s `web-client/racko-remote/dist/` onto `/var/www/racko-remote/`.
+4. Runs `systemctl restart racko-broker`.
+5. Runs `nginx -t` and, only if that succeeds, `systemctl reload nginx`.
+6. `curl -fsS http://127.0.0.1:9091/healthz`.
+   On failure it restores `broker.prev`, restarts `racko-broker`, and exits non-zero.
+
+Manual rollback:
+
+```bash
+cp /opt/racko/broker.prev /opt/racko/broker
+sudo systemctl restart racko-broker
+```

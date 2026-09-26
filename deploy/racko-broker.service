@@ -1,0 +1,18 @@
+[Unit]
+Description=Racko RDP broker (RDCleanPath WebSocket relay + management API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gisuladmin
+WorkingDirectory=/opt/racko
+EnvironmentFile=/opt/racko/broker.env
+ExecStart=/opt/racko/broker
+Restart=on-failure
+RestartSec=2
+# Raise the open-file limit for many concurrent WebSocket/RDP sessions.
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

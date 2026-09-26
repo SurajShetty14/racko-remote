@@ -1,7 +1,6 @@
-mod api;
-mod config;
-mod registry;
-mod session;
+//! RDCleanPath WebSocket-to-RDP broker entrypoint.
+
+#![allow(unused_crate_dependencies)] // thin binary; deps are exercised via the `broker` library
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,9 +10,9 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::api::ApiState;
-use crate::config::Config;
-use crate::registry::Registry;
+use broker::api::ApiState;
+use broker::config::Config;
+use broker::registry::Registry;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
         metrics,
     };
     tokio::spawn(async move {
-        if let Err(err) = api::serve(management_bind, api_state).await {
+        if let Err(err) = broker::api::serve(management_bind, api_state).await {
             tracing::error!(error = %err, "management API stopped");
         }
     });
@@ -56,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
         let registry = Arc::clone(&registry);
         let conn_id = next_id.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
-            session::handle_connection(tcp, peer, config, registry, conn_id).await;
+            broker::session::handle_connection(tcp, peer, config, registry, conn_id).await;
         });
     }
 }

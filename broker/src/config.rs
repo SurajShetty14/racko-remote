@@ -20,7 +20,7 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
-        let file = dotenv_map(Path::new(env!("CARGO_MANIFEST_DIR")).join(".env"));
+        let file = dotenv_map(broker_dotenv_path());
 
         let bind = lookup(&file, "BIND_ADDR")
             .unwrap_or_else(|| "0.0.0.0:7171".to_owned())
@@ -72,7 +72,13 @@ fn lookup(file: &HashMap<String, String>, key: &str) -> Option<String> {
     std::env::var(key).ok().or_else(|| file.get(key).cloned())
 }
 
-fn dotenv_map(path: impl AsRef<Path>) -> HashMap<String, String> {
+/// Absolute path to `broker/.env` (git-ignored).
+pub fn broker_dotenv_path() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(".env")
+}
+
+/// Parse a dotenv-style file into a map (no shell expansion).
+pub fn dotenv_map(path: impl AsRef<Path>) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let Ok(text) = std::fs::read_to_string(path) else {
         return map;

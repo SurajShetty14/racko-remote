@@ -6,9 +6,29 @@ description = "Minimal RDCleanPath WebSocket-to-RDP broker for the ironrdp-web P
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "broker"
+path = "src/lib.rs"
+doctest = false
+test = false
+
 [[bin]]
 name = "broker"
 path = "src/main.rs"
+
+[[bin]]
+name = "modeb_probe"
+path = "src/bin/modeb_probe.rs"
+
+[[bin]]
+name = "modeb_encode_probe"
+path = "src/bin/modeb_encode_probe.rs"
+required-features = ["modeb-encode"]
+
+[features]
+default = []
+# Phase 2: GStreamer NVENC/x264 encode path (needs system GStreamer + plugins on Linux).
+modeb-encode = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
 anyhow = "1"
@@ -16,10 +36,18 @@ axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dashmap = "6"
 futures-util = "0.3"
+gstreamer = { version = "0.24", optional = true }
+gstreamer-app = { version = "0.24", optional = true }
+gstreamer-video = { version = "0.24", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+ironrdp-connector = { path = "../crates/ironrdp-connector" }
 ironrdp-core = { path = "../crates/ironrdp-core", features = ["std"] }
+ironrdp-graphics = { path = "../crates/ironrdp-graphics" }
 ironrdp-pdu = { path = "../crates/ironrdp-pdu", features = ["std"] }
 ironrdp-rdcleanpath = { path = "../crates/ironrdp-rdcleanpath" }
+ironrdp-session = { path = "../crates/ironrdp-session" }
 ironrdp-tls = { path = "../crates/ironrdp-tls", features = ["native-tls"] }
+ironrdp-tokio = { path = "../crates/ironrdp-tokio", features = ["reqwest"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 serde = { version = "1", features = ["derive"] }
@@ -31,3 +59,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 x509-cert = { version = "0.3", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true
