@@ -93,6 +93,9 @@ struct SessionBuilderInner {
     enable_credssp: bool,
     enable_server_pointer: bool,
     legacy_graphics: bool,
+    disable_wallpaper: bool,
+    disable_menu_animations: bool,
+    disable_font_smoothing: bool,
     outbound_message_size_limit: Option<usize>,
 }
 
@@ -137,6 +140,9 @@ impl Default for SessionBuilderInner {
             enable_credssp: true,
             enable_server_pointer: true,
             legacy_graphics: false,
+            disable_wallpaper: true,
+            disable_menu_animations: true,
+            disable_font_smoothing: true,
             outbound_message_size_limit: None,
         }
     }
@@ -257,6 +263,9 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
             |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
+            |disable_wallpaper: bool| { self.0.borrow_mut().disable_wallpaper = disable_wallpaper };
+            |disable_menu_animations: bool| { self.0.borrow_mut().disable_menu_animations = disable_menu_animations };
+            |disable_font_smoothing: bool| { self.0.borrow_mut().disable_font_smoothing = disable_font_smoothing };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -364,6 +373,9 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name,
             outbound_message_size_limit,
             legacy_graphics,
+            disable_wallpaper,
+            disable_menu_animations,
+            disable_font_smoothing,
         );
 
         {
@@ -407,6 +419,9 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name = inner.printer_driver_name.clone();
             outbound_message_size_limit = inner.outbound_message_size_limit;
             legacy_graphics = inner.legacy_graphics;
+            disable_wallpaper = inner.disable_wallpaper;
+            disable_menu_animations = inner.disable_menu_animations;
+            disable_font_smoothing = inner.disable_font_smoothing;
         }
 
         if pcb.is_some() && vmconnect.is_some() {
@@ -422,6 +437,11 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             client_name.clone(),
             desktop_size,
             legacy_graphics,
+            Experience {
+                disable_wallpaper,
+                disable_menu_animations,
+                disable_font_smoothing,
+            },
         );
 
         let enable_credssp = self.0.borrow().enable_credssp;
@@ -1452,6 +1472,27 @@ fn parse_file_metadata_array(files: JsValue) -> Result<Vec<FileMetadata>, IronEr
     Ok(file_list)
 }
 
+struct Experience {
+    disable_wallpaper: bool,
+    disable_menu_animations: bool,
+    disable_font_smoothing: bool,
+}
+
+fn performance_flags(experience: &Experience) -> PerformanceFlags {
+    let mut flags = PerformanceFlags::DISABLE_FULLWINDOWDRAG;
+    if experience.disable_wallpaper {
+        flags |= PerformanceFlags::DISABLE_WALLPAPER;
+    }
+    if experience.disable_menu_animations {
+        flags |= PerformanceFlags::DISABLE_MENUANIMATIONS;
+    }
+    // Font smoothing is opt-in. Leaving the bit unset asks the server to turn it off.
+    if !experience.disable_font_smoothing {
+        flags |= PerformanceFlags::ENABLE_FONT_SMOOTHING;
+    }
+    flags
+}
+
 fn build_config(
     username: String,
     password: String,
@@ -1459,8 +1500,14 @@ fn build_config(
     client_name: String,
     desktop_size: DesktopSize,
     legacy_graphics: bool,
+    experience: Experience,
 ) -> connector::Config {
     // Win7-class servers need 32-bpp lossless bitmaps and no advertised codecs.
+    // The modern path stays at 32 bpp without chroma subsampling. 16 bpp plus
+    // ALLOW_COLOR_SUBSAMPLING was the source of the blocky desktop. Classic
+    // RemoteFX stays in the bitmap-codec list. EGFX (RemoteFX Progressive) is
+    // not advertised: this server's progressive stream fails in the decoder
+    // and would drop the session.
     let bitmap = if legacy_graphics {
         connector::BitmapConfig {
             color_depth: 32,
@@ -1469,11 +1516,22 @@ fn build_config(
         }
     } else {
         connector::BitmapConfig {
-            color_depth: 16,
-            lossy_compression: true,
+            color_depth: 32,
+            lossy_compression: false,
             codecs: client_codecs_capabilities(&[]).expect("can't panic for &[]"),
         }
     };
+
+    info!(
+        width = desktop_size.width,
+        height = desktop_size.height,
+        color_depth = bitmap.color_depth,
+        lossy_subsampling = bitmap.lossy_compression,
+        remotefx = !legacy_graphics,
+        egfx = false,
+        h264 = false,
+        "graphics request"
+    );
 
     connector::Config {
         credentials: Credentials::UsernamePassword { username, password },
@@ -1517,7 +1575,7 @@ fn build_config(
         pointer_software_rendering: false,
         multitransport_flags: None,
         support_dyn_vc_gfx_protocol: false,
-        performance_flags: PerformanceFlags::default(),
+        performance_flags: performance_flags(&experience),
         desktop_scale_factor: 0,
         hardware_id: None,
         license_cache: None,

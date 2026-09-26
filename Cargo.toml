@@ -4,6 +4,7 @@ members = [
   "benches",
   "xtask",
   "ffi",
+  "broker",
 ]
 resolver = "2"
 

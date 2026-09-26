@@ -65,6 +65,21 @@ export function legacyGraphics(enable: boolean): Extension {
     return new Extension('legacy_graphics', enable);
 }
 
+/** Ask the server to skip wallpaper. `disable` true turns the feature off. */
+export function disableWallpaper(disable: boolean): Extension {
+    return new Extension('disable_wallpaper', disable);
+}
+
+/** Ask the server to skip menu animations. */
+export function disableMenuAnimations(disable: boolean): Extension {
+    return new Extension('disable_menu_animations', disable);
+}
+
+/** Ask the server to skip font smoothing. */
+export function disableFontSmoothing(disable: boolean): Extension {
+    return new Extension('disable_font_smoothing', disable);
+}
+
 // --- File transfer (RDP-specific) ---
 
 export { RdpFileTransferProvider } from './RdpFileTransferProvider';

@@ -1,40 +1,23 @@
-name: CI
+name: Deploy
 
 on:
-  pull_request:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
 
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-
 jobs:
-  broker:
-    name: Broker
-    runs-on: ubuntu-latest
+  deploy:
+    name: Deploy to the Ubuntu box
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: [self-hosted, racko-deploy]
+    environment: production
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.1
-          components: clippy
-
-      - name: Build broker
-        run: cargo build -p broker --release --locked
-
-      - name: Test broker
-        run: cargo test -p broker --locked
-
-      - name: Clippy
-        run: cargo clippy -p broker --all-targets --locked -- -D warnings
-
-  frontend:
-    name: Frontend
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,6 +30,9 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
+      - name: Build broker
+        run: cargo build -p broker --release --locked
+
       - name: Build ironrdp-web
         run: |
           set -euo pipefail
@@ -58,24 +44,30 @@ jobs:
           fi
           sed -i "s|new URL('ironrdp_web_bg.wasm', import.meta.url)|wasmUrl|" "$pkg"
 
-      - name: Build and typecheck iron-remote-desktop
+      - name: Build iron-remote-desktop
         working-directory: web-client/iron-remote-desktop
         run: |
           npm ci
           npm run build
-          npm run check
 
-      # build-alone is the Vite build. `npm run build` also runs pre-build.js,
-      # which swallows a failed `cargo xtask web build`, so wasm-pack above is the step that fails the job.
-      - name: Build and typecheck iron-remote-desktop-rdp
+      # Vite-only build. wasm-pack above is what fails the job if the WASM build fails.
+      - name: Build iron-remote-desktop-rdp
         working-directory: web-client/iron-remote-desktop-rdp
         run: |
           npm ci
           npm run build-alone
-          npm run check
 
-      - name: Build and typecheck racko-remote
+      - name: Build racko-remote
         working-directory: web-client/racko-remote
+        env:
+          VITE_GATEWAY_URL: ${{ secrets.VITE_GATEWAY_URL }}
+          VITE_BROKER_API_BASE: ${{ secrets.VITE_BROKER_API_BASE }}
         run: |
+          set -euo pipefail
+          test -n "$VITE_GATEWAY_URL"
+          test -n "$VITE_BROKER_API_BASE"
           npm ci
           npm run build
+
+      - name: Deploy
+        run: bash scripts/deploy.sh

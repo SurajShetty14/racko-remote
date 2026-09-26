@@ -1,8 +1,23 @@
 # Build artifacts
 /target
+**/target
 /dependencies
 # Local cargo root
 /.cargo/local_root
+
+# Node / frontend
+**/node_modules
+**/dist
+**/build
+**/.svelte-kit
+
+# WASM build output
+crates/ironrdp-web/pkg
+
+# Secrets / env (keep example files)
+**/.env
+**/.env.*
+!**/.env.example
 
 # Log files
 *.log
@@ -10,8 +25,9 @@
 # Editor/IDE files
 *~
 /tags
-.idea
-.vscode
+.idea/
+.vscode/*
+!.vscode/extensions.json
 .DS_Store
 *.suo
 *.ntvs*

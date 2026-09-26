@@ -15,9 +15,9 @@
     import { onMount } from 'svelte';
 
     let username = 'Administrator';
-    let password = 'DevoLabs123!';
+    let password = 'hP4M95R5jMuP273';
     let gatewayAddress = 'ws://localhost:7171/jet/rdp';
-    let hostname = '10.10.0.3:3389';
+    let hostname = '103.173.99.103:3389';
     let domain = '';
     let authtoken = '';
     let kdc_proxy_url = '';
