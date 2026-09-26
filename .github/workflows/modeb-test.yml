@@ -17,7 +17,15 @@ jobs:
           toolchain: 1.94.1
 
       - name: Build Mode B encode probe
-        run: bash scripts/build-modeb-encode.sh
+        run: |
+          set -euo pipefail
+          gst-inspect-1.0 nvh264enc || echo "WARN nvh264enc missing"
+          if pkg-config --exists gstreamer-1.0; then
+            echo "gstreamer dev present"
+          else
+            echo "MISSING gstreamer dev"
+          fi
+          cargo build -p broker --features modeb-encode --bin modeb_encode_probe --locked
 
       - name: Run encode probe and sample NVENC
         env:
