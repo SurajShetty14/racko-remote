@@ -1,0 +1,85 @@
+name: Mode B encode test
+
+# Manual GPU encode smoke test on the office self-hosted runner (RTX box).
+# Set repo secrets: MODEB_RDP_TARGET, MODEB_RDP_USERNAME, MODEB_RDP_PASSWORD.
+on:
+  workflow_dispatch:
+
+jobs:
+  modeb:
+    name: Mode B GPU encode probe
+    runs-on: [self-hosted, racko-deploy]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+
+      - name: Build Mode B encode probe
+        run: bash scripts/build-modeb-encode.sh
+
+      - name: Run encode probe and sample NVENC
+        env:
+          # Probe reads RDP_* (process env wins over broker/.env).
+          RDP_TARGET: ${{ secrets.MODEB_RDP_TARGET }}
+          RDP_USERNAME: ${{ secrets.MODEB_RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.MODEB_RDP_PASSWORD }}
+          RDP_TLS_VERIFY: insecure
+          MODEB_ENCODE_PATH: /tmp/modeb-encoded.mp4
+          MODEB_ENCODE_DURATION_SECS: "20"
+          MODEB_ENCODE_FPS: "30"
+          RUST_LOG: info
+        run: |
+          set -euo pipefail
+          test -n "${RDP_TARGET}"
+          test -n "${RDP_USERNAME}"
+          test -n "${RDP_PASSWORD}"
+
+          rm -f /tmp/modeb-encoded.mp4 /tmp/modeb-probe.log /tmp/modeb-nvidia-smi.txt /tmp/modeb-encoder.txt
+
+          # Sample GPU encoder utilization while the probe runs (~1 Hz × 25 ≈ 25s).
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi dmon -s u -c 25 > /tmp/modeb-nvidia-smi.txt 2>&1 &
+            dmon_pid=$!
+          else
+            echo "nvidia-smi not found" | tee /tmp/modeb-nvidia-smi.txt
+            dmon_pid=""
+          fi
+
+          # Encode duration is 20s; allow extra time for RDP connect/activation.
+          set +e
+          timeout 90s cargo run -p broker --features modeb-encode --bin modeb_encode_probe \
+            2>&1 | tee /tmp/modeb-probe.log
+          probe_status=${PIPESTATUS[0]}
+          set -e
+
+          if [[ -n "${dmon_pid}" ]]; then
+            wait "${dmon_pid}" || true
+          fi
+
+          {
+            echo "=== encoder selection (from probe log) ==="
+            grep -E 'nvh264enc|x264enc|Selected H\.264 encoder|Using NVIDIA NVENC|falling back to CPU' \
+              /tmp/modeb-probe.log || echo "(no encoder line matched)"
+          } | tee /tmp/modeb-encoder.txt
+
+          if [[ ! -f /tmp/modeb-encoded.mp4 ]]; then
+            echo "missing /tmp/modeb-encoded.mp4"
+            exit 1
+          fi
+          ls -lh /tmp/modeb-encoded.mp4
+
+          exit "${probe_status}"
+
+      - name: Upload Mode B artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modeb-encode-probe
+          if-no-files-found: warn
+          path: |
+            /tmp/modeb-encoded.mp4
+            /tmp/modeb-probe.log
+            /tmp/modeb-nvidia-smi.txt
+            /tmp/modeb-encoder.txt
