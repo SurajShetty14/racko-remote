@@ -3,7 +3,7 @@
 #![allow(unused_crate_dependencies)] // thin binary; deps are exercised via the `broker` library
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;

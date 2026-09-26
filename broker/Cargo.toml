@@ -60,5 +60,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 x509-cert = { version = "0.3", default-features = false, features = ["std"] }
 
-[lints]
-workspace = true
+# Application crate: do not inherit IronRDP's library-grade restriction lints
+# (`workspace = true`). Clippy correctness/suspicious stay on via defaults;
+# `-D warnings` still fails the build on real issues.
+[lints.clippy]
+as_conversions = "allow"
+partial_pub_fields = "allow"

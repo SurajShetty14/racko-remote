@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 use std::path::Path;
-use std::time::Duration;
+use core::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::{Context as _, bail};
 
 /// Runtime settings. Process environment wins over `broker/.env`.
 #[derive(Clone, Debug)]

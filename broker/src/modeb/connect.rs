@@ -3,7 +3,7 @@
 use core::time::Duration;
 use std::path::PathBuf;
 
-use anyhow::{Context, bail};
+use anyhow::{Context as _, bail};
 use ironrdp_connector::{ClientConnector, ConnectionResult, Credentials, DesktopSize};
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_pdu::gcc::{ConnectionType, KeyboardType};
@@ -13,7 +13,7 @@ use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_tls::CertificateValidation;
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
-use ironrdp_tokio::{FramedWrite, TokioFramed};
+use ironrdp_tokio::{FramedWrite as _, TokioFramed};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, interval};

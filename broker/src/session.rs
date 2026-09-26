@@ -9,24 +9,24 @@
 //! that peer: it forwards the client's X.224 request, upgrades the server TCP socket with
 //! `ironrdp-tls` (the same helper the connector uses), and then copies bytes.
 
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use core::time::Duration;
 
-use anyhow::{Context, bail};
-use futures_util::{SinkExt, StreamExt};
+use anyhow::{Context as _, bail};
+use futures_util::{SinkExt as _, StreamExt as _};
 use ironrdp_pdu::nego::ConnectionConfirm;
 use ironrdp_pdu::tpkt::TpktHeader;
 use ironrdp_pdu::x224::X224;
 use ironrdp_rdcleanpath::{RDCleanPath, RDCleanPathPdu};
 use ironrdp_tls::CertificateValidation;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
-use x509_cert::der::Encode;
+use x509_cert::der::Encode as _;
 
 use crate::config::{Config, split_host_port};
 use crate::registry::{LiveSession, Registry};
@@ -324,7 +324,7 @@ where
 
     let idle_watch = async move {
         if idle_timeout.is_zero() {
-            std::future::pending::<()>().await;
+            core::future::pending::<()>().await;
         }
         loop {
             let idle_for = idle_session.idle_for();

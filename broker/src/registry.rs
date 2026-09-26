@@ -1,7 +1,7 @@
 //! In-memory registry of relays that have finished the RDCleanPath handshake.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -89,6 +89,12 @@ pub struct SessionView {
 
 pub struct Registry {
     sessions: DashMap<Uuid, Arc<Session>>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Registry {

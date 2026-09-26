@@ -1,6 +1,6 @@
 //! HTTP management API and Prometheus text exposition, separate from the relay.
 
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Json;
