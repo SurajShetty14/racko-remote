@@ -1,14 +1,18 @@
 import { type FormEvent, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 
+import type { ModeBRequest } from '../modeb';
 import { DESKTOP_PRESETS } from '../rdp';
 import { saveConnectRequest } from '../session-store';
 
+type SessionMode = 'mode-c' | 'mode-b';
+
 export function ConnectPage() {
   const navigate = useNavigate();
-  const [hostname, setHostname] = useState('103.173.99.103:3389');
-  const [username, setUsername] = useState('Administrator');
-  const [password, setPassword] = useState('hP4M95R5jMuP273');
+  const [mode, setMode] = useState<SessionMode>('mode-c');
+  const [hostname, setHostname] = useState(import.meta.env.VITE_DEV_RDP_HOST ?? '');
+  const [username, setUsername] = useState(import.meta.env.VITE_DEV_RDP_USER ?? '');
+  const [password, setPassword] = useState('');
   const [domain, setDomain] = useState('');
   const [desktop, setDesktop] = useState(`${DESKTOP_PRESETS[0].width}x${DESKTOP_PRESETS[0].height}`);
   const [error, setError] = useState('');
@@ -19,7 +23,11 @@ export function ConnectPage() {
     const user = username.trim();
     const port = host.includes(':') ? host.slice(host.lastIndexOf(':') + 1) : '';
     if (!/^\d+$/.test(port)) {
-      setError('Hostname must be host:port, for example 103.173.99.103:3389.');
+      setError('Hostname must be host:port, for example rdp.example.com:3389.');
+      return;
+    }
+    if (mode === 'mode-b') {
+      navigate('/modeb', { state: { hostname: host } satisfies ModeBRequest });
       return;
     }
     if (user === '' || password === '') {
@@ -56,51 +64,64 @@ export function ConnectPage() {
         </nav>
 
         <label>
+          Mode
+          <select value={mode} onChange={(event) => setMode(event.target.value as SessionMode)}>
+            <option value="mode-c">Mode C (browser decode)</option>
+            <option value="mode-b">Mode B (GPU stream)</option>
+          </select>
+        </label>
+        <label>
           Hostname
           <input
             value={hostname}
             onChange={(event) => setHostname(event.target.value)}
-            placeholder="103.173.99.103:3389"
+            placeholder="rdp.example.com:3389"
             autoComplete="off"
             spellCheck={false}
           />
         </label>
-        <label>
-          Username
-          <input
-            value={username}
-            onChange={(event) => setUsername(event.target.value)}
-            autoComplete="username"
-          />
-        </label>
-        <label>
-          Password
-          <input
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            autoComplete="current-password"
-          />
-        </label>
-        <label>
-          Resolution
-          <select value={desktop} onChange={(event) => setDesktop(event.target.value)}>
-            {DESKTOP_PRESETS.map((size) => (
-              <option key={`${size.width}x${size.height}`} value={`${size.width}x${size.height}`}>
-                {size.width}×{size.height}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Domain
-          <span className="optional">optional</span>
-          <input
-            value={domain}
-            onChange={(event) => setDomain(event.target.value)}
-            autoComplete="off"
-          />
-        </label>
+        {mode === 'mode-c' ? (
+          <>
+            <label>
+              Username
+              <input
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+                autoComplete="username"
+              />
+            </label>
+            <label>
+              Password
+              <input
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                autoComplete="current-password"
+              />
+            </label>
+            <label>
+              Resolution
+              <select value={desktop} onChange={(event) => setDesktop(event.target.value)}>
+                {DESKTOP_PRESETS.map((size) => (
+                  <option key={`${size.width}x${size.height}`} value={`${size.width}x${size.height}`}>
+                    {size.width}×{size.height}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Domain
+              <span className="optional">optional</span>
+              <input
+                value={domain}
+                onChange={(event) => setDomain(event.target.value)}
+                autoComplete="off"
+              />
+            </label>
+          </>
+        ) : (
+          <p className="lede">The broker signs in and picks the desktop size; no credentials leave this page.</p>
+        )}
 
         {error !== '' ? <p className="form-error">{error}</p> : null}
 
