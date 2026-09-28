@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Racko Mode B WebRTC test</title>
+  <style>
+    body { margin: 0; background: #111; color: #ddd; font: 13px/1.4 monospace; }
+    video { display: block; max-width: 100vw; max-height: 75vh; margin: 0 auto; background: #000; }
+    #log { height: 25vh; overflow-y: auto; margin: 0; padding: 6px 10px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay muted playsinline></video>
+  <pre id="log"></pre>
+  <script>
+    const video = document.getElementById('video');
+    const logEl = document.getElementById('log');
+
+    function log(...parts) {
+      const line = `${new Date().toISOString().slice(11, 23)} ${parts.join(' ')}`;
+      console.log(line);
+      logEl.textContent += line + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/webrtc`;
+    const ws = new WebSocket(wsUrl);
+    const send = (msg) => ws.send(JSON.stringify(msg));
+
+    // Host candidates only: no STUN/TURN for the local Phase 3a test.
+    const pc = new RTCPeerConnection({ iceServers: [] });
+
+    pc.onsignalingstatechange = () => log('signaling state:', pc.signalingState);
+    pc.onicegatheringstatechange = () => log('ICE gathering state:', pc.iceGatheringState);
+    pc.oniceconnectionstatechange = () => log('ICE connection state:', pc.iceConnectionState);
+    pc.onconnectionstatechange = () => log('peer connection state:', pc.connectionState);
+
+    pc.onicecandidate = ({ candidate }) => {
+      if (!candidate) {
+        log('local ICE gathering complete');
+        send({ type: 'ice', candidate: '', sdpMLineIndex: 0 });
+        return;
+      }
+      log('local ICE candidate:', candidate.candidate);
+      send({ type: 'ice', candidate: candidate.candidate, sdpMLineIndex: candidate.sdpMLineIndex ?? 0 });
+    };
+
+    pc.ontrack = ({ track, streams }) => {
+      log('remote track:', track.kind, track.id);
+      video.srcObject = streams[0] ?? new MediaStream([track]);
+      video.play().catch((err) => log('video.play() failed:', err));
+    };
+
+    video.onloadedmetadata = () => log(`video playing ${video.videoWidth}x${video.videoHeight}`);
+
+    ws.onopen = () => log('signaling connected:', wsUrl, '(broker is connecting to RDP; the offer follows)');
+    ws.onclose = (ev) => log('signaling closed:', ev.code, ev.reason || '');
+    ws.onerror = () => log('signaling error');
+
+    ws.onmessage = async ({ data }) => {
+      const msg = JSON.parse(data);
+      try {
+        if (msg.type === 'offer') {
+          log('received SDP offer');
+          await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          log('sending SDP answer');
+          send({ type: 'answer', sdp: pc.localDescription.sdp });
+        } else if (msg.type === 'ice') {
+          log('remote ICE candidate:', msg.candidate);
+          await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex });
+        } else {
+          log('unexpected signaling message:', data);
+        }
+      } catch (err) {
+        log('signaling handling failed:', err);
+      }
+    };
+
+    window.addEventListener('beforeunload', () => { ws.close(); pc.close(); });
+  </script>
+</body>
+</html>

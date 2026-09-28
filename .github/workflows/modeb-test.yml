@@ -25,6 +25,11 @@ jobs:
           else
             echo "MISSING gstreamer dev"
           fi
+          if pkg-config --exists gstreamer-webrtc-1.0 gstreamer-sdp-1.0; then
+            echo "gstreamer webrtc/sdp dev present"
+          else
+            echo "MISSING gstreamer webrtc/sdp dev (libgstreamer-plugins-bad1.0-dev)"
+          fi
           cargo build -p broker --features modeb-encode --bin modeb_encode_probe --locked
 
       - name: Run encode probe and sample NVENC

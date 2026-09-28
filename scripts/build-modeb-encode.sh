@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Mode B encode probe on Linux (Ubuntu box or CI).
+# Build Mode B encode + WebRTC probes on Linux (Ubuntu box or CI).
 # Never runs sudo/apt — install GStreamer packages once on the box by hand.
 set -euo pipefail
 
@@ -7,6 +7,9 @@ missing=0
 
 if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists gstreamer-1.0; then
   echo "ERROR: GStreamer development headers not found (pkg-config gstreamer-1.0)."
+  missing=1
+elif ! pkg-config --exists gstreamer-webrtc-1.0 gstreamer-sdp-1.0; then
+  echo "ERROR: GStreamer WebRTC/SDP development headers not found (pkg-config gstreamer-webrtc-1.0 gstreamer-sdp-1.0)."
   missing=1
 fi
 
@@ -25,27 +28,30 @@ Install once on the Ubuntu GPU box (as a user with apt privileges), then re-run:
     pkg-config \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
+    libgstreamer-plugins-bad1.0-dev \
     gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly \
-    gstreamer1.0-libav
+    gstreamer1.0-libav \
+    gstreamer1.0-nice
 
 Verify:
 
-  pkg-config --exists gstreamer-1.0 && echo "gstreamer-1.0 ok"
+  pkg-config --exists gstreamer-1.0 gstreamer-webrtc-1.0 gstreamer-sdp-1.0 && echo "gstreamer dev ok"
   gst-inspect-1.0 nvh264enc
+  gst-inspect-1.0 webrtcbin
 
 EOF
   exit 1
 fi
 
-echo "GStreamer present (gstreamer-1.0 + nvh264enc); building modeb_encode_probe"
-cargo build -p broker --features modeb-encode --bin modeb_encode_probe --locked
+echo "GStreamer present (gstreamer-1.0 + webrtc/sdp + nvh264enc); building Mode B probes"
+cargo build -p broker --features modeb-encode --bin modeb_encode_probe --bin modeb_webrtc_probe --locked
 
 echo
 echo "Run (after editing broker/.env or exporting RDP_*):"
-echo "  cargo run -p broker --features modeb-encode --bin modeb_encode_probe"
+echo "  cargo run -p broker --features modeb-encode --bin modeb_encode_probe   # MP4 -> /tmp/modeb-encoded.mp4"
+echo "  cargo run -p broker --features modeb-encode --bin modeb_webrtc_probe   # open http://127.0.0.1:8080/modeb.html"
 echo "While running, check NVENC load:"
 echo "  nvidia-smi dmon -s u"
-echo "Output: /tmp/modeb-encoded.mp4"

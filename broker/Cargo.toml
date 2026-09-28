@@ -25,10 +25,22 @@ name = "modeb_encode_probe"
 path = "src/bin/modeb_encode_probe.rs"
 required-features = ["modeb-encode"]
 
+[[bin]]
+name = "modeb_webrtc_probe"
+path = "src/bin/modeb_webrtc_probe.rs"
+required-features = ["modeb-encode"]
+
 [features]
 default = []
-# Phase 2: GStreamer NVENC/x264 encode path (needs system GStreamer + plugins on Linux).
-modeb-encode = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+# Phase 2/3a: GStreamer NVENC/x264 encode to MP4 or WebRTC (needs system GStreamer + plugins on Linux).
+modeb-encode = [
+    "dep:gstreamer",
+    "dep:gstreamer-app",
+    "dep:gstreamer-sdp",
+    "dep:gstreamer-video",
+    "dep:gstreamer-webrtc",
+    "axum/ws",
+]
 
 [dependencies]
 anyhow = "1"
@@ -38,7 +50,9 @@ dashmap = "6"
 futures-util = "0.3"
 gstreamer = { version = "0.24", optional = true }
 gstreamer-app = { version = "0.24", optional = true }
+gstreamer-sdp = { version = "0.24", optional = true }
 gstreamer-video = { version = "0.24", optional = true }
+gstreamer-webrtc = { version = "0.24", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ironrdp-connector = { path = "../crates/ironrdp-connector" }
 ironrdp-core = { path = "../crates/ironrdp-core", features = ["std"] }

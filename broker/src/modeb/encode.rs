@@ -4,15 +4,16 @@
 //! NVIDIA element is missing. Proof of encode is a finalized MP4 on disk; on a
 //! box with an RTX GPU, `nvidia-smi` should show non-zero encoder utilization.
 
-use std::path::{Path, PathBuf};
+use core::pin::pin;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
-use gstreamer_app::prelude::*;
 use gstreamer_video as gst_video;
+use gstreamer_video::prelude::*;
 use ironrdp_session::image::DecodedImage;
 use tracing::{info, warn};
 
@@ -23,7 +24,7 @@ use crate::modeb::connect;
 /// Default Linux path for the Mode B encode proof MP4.
 pub const ENCODED_MP4_PATH: &str = "/tmp/modeb-encoded.mp4";
 
-const DEFAULT_FPS: u32 = 30;
+pub(super) const DEFAULT_FPS: u32 = 30;
 const DEFAULT_DURATION_SECS: u64 = 10;
 
 /// Encode-session settings (output path, duration, fps).
@@ -78,6 +79,18 @@ pub async fn run_encode(rdp: ModeBConfig, encode: EncodeConfig) -> anyhow::Resul
 
     gst::init().context("gstreamer init")?;
 
+    let output_path = &encode.output_path;
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create parent dir for {}", output_path.display()))?;
+        }
+    }
+    let location = output_path
+        .to_str()
+        .context("output path is not UTF-8")?
+        .replace('\\', "/");
+
     let (connection_result, framed) = connect::connect(&rdp).await.context("Mode B connect")?;
     let width = connection_result.desktop_size.width;
     let height = connection_result.desktop_size.height;
@@ -90,8 +103,13 @@ pub async fn run_encode(rdp: ModeBConfig, encode: EncodeConfig) -> anyhow::Resul
         "Negotiated session parameters"
     );
 
-    let mut encoder = H264FileEncoder::new(width, height, encode.fps, &encode.output_path)
-        .context("build H.264 encode pipeline")?;
+    let tail = format!(
+        "h264parse name=modeb-parse \
+         ! mp4mux name=modeb-mux \
+         ! filesink name=modeb-sink location=\"{location}\" sync=false"
+    );
+    let mut encoder =
+        H264Pipeline::build(width, height, encode.fps, &tail, false).context("build H.264 encode pipeline")?;
 
     info!(
         encoder = encoder.encoder_name(),
@@ -99,21 +117,26 @@ pub async fn run_encode(rdp: ModeBConfig, encode: EncodeConfig) -> anyhow::Resul
         "Selected H.264 encoder element"
     );
 
-    let mut image = ironrdp_session::image::DecodedImage::new(
-        ironrdp_graphics::image_processing::PixelFormat::RgbA32,
-        width,
-        height,
-    );
+    encoder.play()?;
 
-    connect::active_session_encode(connection_result, framed, &mut image, &encode, &mut encoder)
+    let mut image = DecodedImage::new(ironrdp_graphics::image_processing::PixelFormat::RgbA32, width, height);
+
+    let duration = encode.duration;
+    let stop = pin!(async move {
+        tokio::time::sleep(duration).await;
+        Ok::<_, anyhow::Error>("encode duration elapsed")
+    });
+    connect::active_session_encode(connection_result, framed, &mut image, encode.fps, stop, &mut encoder)
         .await
         .context("Mode B encode session")?;
 
-    encoder.finish().context("finalize MP4")?;
     info!(
-        path = %encode.output_path.display(),
-        "Mode B encode probe complete"
+        frames_pushed = encoder.frames_pushed(),
+        path = %output_path.display(),
+        "Sending EOS to finalize MP4"
     );
+    encoder.finish().context("finalize MP4")?;
+    info!(path = %output_path.display(), "Mode B encode probe complete");
     Ok(())
 }
 
@@ -135,12 +158,14 @@ impl EncoderKind {
         matches!(self, Self::NvH264)
     }
 
-    /// Element fragment used inside `gst::parse::launch`.
-    fn launch_fragment(self) -> &'static str {
+    /// Element fragment used inside `gst::parse::launch`; one keyframe per second.
+    fn launch_fragment(self, fps: u32) -> String {
         match self {
             // bitrate is kbit/sec on both encoders.
-            Self::NvH264 => "nvh264enc preset=low-latency-hq bitrate=4000",
-            Self::X264 => "x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max=30",
+            Self::NvH264 => format!("nvh264enc preset=low-latency-hq bitrate=4000 gop-size={fps}"),
+            Self::X264 => {
+                format!("x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max={fps}")
+            }
         }
     }
 }
@@ -161,56 +186,58 @@ fn select_encoder() -> anyhow::Result<EncoderKind> {
     }
 }
 
-/// appsrc(RGBA) → videoconvert → {nvh264enc|x264enc} → h264parse → mp4mux → filesink
-struct H264FileEncoder {
+/// appsrc(RGBA) → [leaky queue] → videoconvert → {nvh264enc|x264enc} → `tail`
+///
+/// The pipeline is set to NULL on drop.
+pub(super) struct H264Pipeline {
     pipeline: gst::Pipeline,
     appsrc: gst_app::AppSrc,
     video_info: gst_video::VideoInfo,
     kind: EncoderKind,
     fps: u32,
+    live: bool,
     frame_index: u64,
-    output_path: PathBuf,
 }
 
-impl H264FileEncoder {
-    fn new(width: u16, height: u16, fps: u32, output_path: &Path) -> anyhow::Result<Self> {
-        if let Some(parent) = output_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("create parent dir for {}", output_path.display()))?;
-            }
-        }
-
+impl H264Pipeline {
+    /// Build (but do not start) the pipeline; `tail` is linked after the encoder.
+    ///
+    /// A `live` pipeline stamps buffers with the pipeline clock and drops frames
+    /// instead of blocking the RDP decode loop when downstream stalls.
+    /// Otherwise buffers are stamped from the frame index and `push_frame` blocks.
+    pub(super) fn build(width: u16, height: u16, fps: u32, tail: &str, live: bool) -> anyhow::Result<Self> {
         let kind = select_encoder()?;
         let width_u32 = u32::from(width);
         let height_u32 = u32::from(height);
-        let location = output_path
-            .to_str()
-            .context("output path is not UTF-8")?
-            .replace('\\', "/");
 
-        let video_info =
-            gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgba, width_u32, height_u32)
-                .fps(gst::Fraction::new(i32::try_from(fps).context("fps fits i32")?, 1))
-                .build()
-                .context("build VideoInfo")?;
+        let video_info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgba, width_u32, height_u32)
+            .fps(gst::Fraction::new(i32::try_from(fps).context("fps fits i32")?, 1))
+            .build()
+            .context("build VideoInfo")?;
+
+        let (do_timestamp, queue) = if live {
+            (
+                "true",
+                "! queue name=modeb-queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 ",
+            )
+        } else {
+            ("false", "")
+        };
 
         // Caps are also set on appsrc below so push_buffer validates format/size.
         let launch = format!(
-            "appsrc name=modeb-src is-live=true format=time do-timestamp=false \
+            "appsrc name=modeb-src is-live=true format=time do-timestamp={do_timestamp} \
              caps=video/x-raw,format=RGBA,width={width_u32},height={height_u32},framerate={fps}/1 \
-             ! videoconvert name=modeb-convert \
+             {queue}! videoconvert name=modeb-convert \
              ! {encoder} name=modeb-enc \
-             ! h264parse name=modeb-parse \
-             ! mp4mux name=modeb-mux \
-             ! filesink name=modeb-sink location=\"{location}\" sync=false",
-            encoder = kind.launch_fragment(),
+             ! {tail}",
+            encoder = kind.launch_fragment(fps),
         );
 
-        info!(pipeline = %launch, "Building GStreamer encode pipeline");
+        info!(pipeline = %launch, "Building GStreamer pipeline");
 
         let pipeline = gst::parse::launch(&launch)
-            .context("parse encode pipeline")?
+            .context("parse GStreamer pipeline")?
             .downcast::<gst::Pipeline>()
             .map_err(|_| anyhow::anyhow!("parsed launch is not a Pipeline"))?;
 
@@ -222,13 +249,9 @@ impl H264FileEncoder {
 
         appsrc.set_format(gst::Format::Time);
         appsrc.set_is_live(true);
-        appsrc.set_block(true);
+        appsrc.set_block(!live);
         appsrc.set_max_bytes(u64::from(width_u32) * u64::from(height_u32) * 4 * 4);
         appsrc.set_caps(Some(&video_info.to_caps().context("video caps")?));
-
-        pipeline
-            .set_state(gst::State::Playing)
-            .context("set pipeline Playing")?;
 
         Ok(Self {
             pipeline,
@@ -236,17 +259,32 @@ impl H264FileEncoder {
             video_info,
             kind,
             fps,
+            live,
             frame_index: 0,
-            output_path: output_path.to_path_buf(),
         })
     }
 
-    fn encoder_name(&self) -> &'static str {
+    pub(super) fn pipeline(&self) -> &gst::Pipeline {
+        &self.pipeline
+    }
+
+    pub(super) fn play(&self) -> anyhow::Result<()> {
+        self.pipeline
+            .set_state(gst::State::Playing)
+            .context("set pipeline Playing")?;
+        Ok(())
+    }
+
+    pub(super) fn encoder_name(&self) -> &'static str {
         self.kind.element_name()
     }
 
-    fn is_hardware(&self) -> bool {
+    pub(super) fn is_hardware(&self) -> bool {
         self.kind.is_hardware()
+    }
+
+    pub(super) fn frames_pushed(&self) -> u64 {
+        self.frame_index
     }
 
     fn push_rgba(&mut self, image: &DecodedImage) -> anyhow::Result<()> {
@@ -270,18 +308,16 @@ impl H264FileEncoder {
         let mut buffer = gst::Buffer::with_size(self.video_info.size()).context("allocate gst buffer")?;
         {
             let buffer = buffer.get_mut().context("gst buffer is not writable")?;
-            let pts = gst::ClockTime::from_nseconds(
-                self.frame_index
-                    .checked_mul(1_000_000_000 / u64::from(self.fps))
-                    .context("pts overflow")?,
-            );
-            let duration = gst::ClockTime::from_nseconds(1_000_000_000 / u64::from(self.fps));
-            buffer.set_pts(pts);
-            buffer.set_duration(duration);
+            let frame_ns = 1_000_000_000 / u64::from(self.fps);
+            if !self.live {
+                let pts =
+                    gst::ClockTime::from_nseconds(self.frame_index.checked_mul(frame_ns).context("pts overflow")?);
+                buffer.set_pts(pts);
+            }
+            buffer.set_duration(gst::ClockTime::from_nseconds(frame_ns));
 
-            let mut vframe =
-                gst_video::VideoFrameRef::from_buffer_ref_writable(buffer, &self.video_info)
-                    .context("wrap gst buffer as video frame")?;
+            let mut vframe = gst_video::VideoFrameRef::from_buffer_ref_writable(buffer, &self.video_info)
+                .context("wrap gst buffer as video frame")?;
             let dst_stride = usize::try_from(vframe.plane_stride()[0]).context("dst stride")?;
             let plane = vframe.plane_data_mut(0).context("plane 0")?;
             for row in 0..height {
@@ -306,16 +342,12 @@ impl H264FileEncoder {
             );
         }
 
-        drain_bus_errors(&self.pipeline)?;
+        drain_bus(&self.pipeline)?;
         Ok(())
     }
 
+    /// Send EOS and wait for it to reach the sink (finalizes muxers such as mp4mux).
     fn finish(self) -> anyhow::Result<()> {
-        info!(
-            frames_pushed = self.frame_index,
-            path = %self.output_path.display(),
-            "Sending EOS to finalize MP4"
-        );
         self.appsrc.end_of_stream().context("appsrc end_of_stream")?;
 
         let bus = self.pipeline.bus().context("pipeline has no bus")?;
@@ -323,7 +355,7 @@ impl H264FileEncoder {
         match bus.timed_pop_filtered(timeout, &[gst::MessageType::Eos, gst::MessageType::Error]) {
             Some(msg) => match msg.view() {
                 gst::MessageView::Eos(..) => {
-                    info!(path = %self.output_path.display(), "Received EOS; MP4 finalized");
+                    info!("Received EOS; pipeline finalized");
                 }
                 gst::MessageView::Error(err) => {
                     bail!(
@@ -334,28 +366,33 @@ impl H264FileEncoder {
                 }
                 _ => {}
             },
-            None => bail!("timed out waiting for EOS while finalizing MP4"),
+            None => bail!("timed out waiting for EOS while finalizing"),
         }
 
-        self.pipeline
-            .set_state(gst::State::Null)
-            .context("set pipeline Null")?;
+        self.pipeline.set_state(gst::State::Null).context("set pipeline Null")?;
         Ok(())
     }
 }
 
-fn drain_bus_errors(pipeline: &gst::Pipeline) -> anyhow::Result<()> {
+impl Drop for H264Pipeline {
+    fn drop(&mut self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+/// Surface errors, log warnings, and apply latency updates; discards other bus messages.
+fn drain_bus(pipeline: &gst::Pipeline) -> anyhow::Result<()> {
     let Some(bus) = pipeline.bus() else {
         return Ok(());
     };
-    while let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Warning]) {
+    while let Some(msg) = bus.pop_filtered(&[
+        gst::MessageType::Error,
+        gst::MessageType::Warning,
+        gst::MessageType::Latency,
+    ]) {
         match msg.view() {
             gst::MessageView::Error(err) => {
-                bail!(
-                    "gstreamer error: {} ({})",
-                    err.error(),
-                    err.debug().unwrap_or_default()
-                );
+                bail!("gstreamer error: {} ({})", err.error(), err.debug().unwrap_or_default());
             }
             gst::MessageView::Warning(warn_msg) => {
                 warn!(
@@ -363,6 +400,11 @@ fn drain_bus_errors(pipeline: &gst::Pipeline) -> anyhow::Result<()> {
                     debug = %warn_msg.debug().unwrap_or_default(),
                     "gstreamer warning"
                 );
+            }
+            gst::MessageView::Latency(..) => {
+                if let Err(err) = pipeline.recalculate_latency() {
+                    warn!(error = %err, "Failed to recalculate pipeline latency");
+                }
             }
             _ => {}
         }
@@ -375,7 +417,7 @@ pub(super) trait EncodeSink {
     fn push_frame(&mut self, image: &DecodedImage) -> anyhow::Result<()>;
 }
 
-impl EncodeSink for H264FileEncoder {
+impl EncodeSink for H264Pipeline {
     fn push_frame(&mut self, image: &DecodedImage) -> anyhow::Result<()> {
         self.push_rgba(image)
     }

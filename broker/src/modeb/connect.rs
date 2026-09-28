@@ -336,12 +336,15 @@ async fn active_session_png(
     }
 }
 
+/// Decode the session and push the framebuffer to `sink` at `fps` until the
+/// server terminates or `stop` resolves (`Ok(reason)` ends the session cleanly).
 #[cfg(feature = "modeb-encode")]
 pub(super) async fn active_session_encode(
     connection_result: ConnectionResult,
     framed: UpgradedFramed,
     image: &mut DecodedImage,
-    encode: &crate::modeb::EncodeConfig,
+    fps: u32,
+    mut stop: core::pin::Pin<&mut dyn core::future::Future<Output = anyhow::Result<&'static str>>>,
     sink: &mut dyn super::encode::EncodeSink,
 ) -> anyhow::Result<()> {
     let (mut reader, mut writer) = ironrdp_tokio::split_tokio_framed(framed);
@@ -358,7 +361,7 @@ pub(super) async fn active_session_encode(
     }
     .build();
 
-    let frame_period = Duration::from_nanos(1_000_000_000 / u64::from(encode.fps));
+    let frame_period = Duration::from_nanos(1_000_000_000 / u64::from(fps));
     let mut push = interval(frame_period);
     push.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Fire immediately so the first encoded frame is not delayed by one period.
@@ -367,14 +370,8 @@ pub(super) async fn active_session_encode(
     let mut update_count: u64 = 0;
     let mut frame_count: u64 = 0;
     let started = Instant::now();
-    let deadline = tokio::time::sleep(encode.duration);
-    tokio::pin!(deadline);
 
-    info!(
-        duration_secs = encode.duration.as_secs(),
-        fps = encode.fps,
-        "Active session started; pushing RGBA to H.264 encoder"
-    );
+    info!(fps, "Active session started; pushing RGBA to H.264 encoder");
 
     loop {
         tokio::select! {
@@ -411,12 +408,12 @@ pub(super) async fn active_session_encode(
                                 update_count,
                                 frame_count,
                                 elapsed_secs = started.elapsed().as_secs(),
-                                "Session terminated before encode duration elapsed"
+                                "Session terminated"
                             );
                             return Ok(());
                         }
                         ActiveStageOutput::DeactivateAll => {
-                            warn!("Server sent Deactivate All; Phase 2 does not reactivate");
+                            warn!("Server sent Deactivate All; Mode B does not reactivate");
                         }
                         ActiveStageOutput::SaveSessionInfo { logon_complete } => {
                             info!(logon_complete, "Save session info");
@@ -428,12 +425,14 @@ pub(super) async fn active_session_encode(
             _ = push.tick() => {
                 sink.push_frame(image).context("push frame to encoder")?;
             }
-            () = &mut deadline => {
+            reason = stop.as_mut() => {
+                let reason = reason?;
                 info!(
+                    reason,
                     update_count,
                     frame_count,
                     elapsed_secs = started.elapsed().as_secs(),
-                    "Encode duration elapsed; stopping RDP session"
+                    "Stopping RDP session"
                 );
                 return Ok(());
             }
@@ -441,12 +440,7 @@ pub(super) async fn active_session_encode(
     }
 }
 
-fn write_frame(
-    image: &DecodedImage,
-    config: &ModeBConfig,
-    update_count: u64,
-    dump_ticks: u64,
-) -> anyhow::Result<()> {
+fn write_frame(image: &DecodedImage, config: &ModeBConfig, update_count: u64, dump_ticks: u64) -> anyhow::Result<()> {
     framebuffer::write_png(image, &config.frame_path)?;
     info!(
         path = %config.frame_path.display(),
