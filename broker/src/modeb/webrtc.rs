@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 use crate::config::{broker_dotenv_path, dotenv_map};
 use crate::modeb::ModeBConfig;
 use crate::modeb::connect;
-use crate::modeb::encode::{DEFAULT_FPS, H264Pipeline};
+use crate::modeb::encode::{EncoderSettings, H264Pipeline};
 use crate::modeb::input::InputTranslator;
 
 /// Label and pre-negotiated SCTP stream id of the browser input channel (must match `modeb.html`).
@@ -81,7 +81,7 @@ const REQUIRED_ELEMENTS: &[&str] = &[
 pub struct WebRtcConfig {
     /// HTTP + signaling listen address (serves `/modeb.html` and `/webrtc`).
     pub bind: SocketAddr,
-    pub fps: u32,
+    pub encoder: EncoderSettings,
 }
 
 impl WebRtcConfig {
@@ -94,15 +94,10 @@ impl WebRtcConfig {
             .parse()
             .context("MODEB_WEBRTC_BIND must be ip:port")?;
 
-        let fps: u32 = lookup("MODEB_ENCODE_FPS")
-            .unwrap_or_else(|| DEFAULT_FPS.to_string())
-            .parse()
-            .context("MODEB_ENCODE_FPS must be a positive integer")?;
-        if fps == 0 {
-            bail!("MODEB_ENCODE_FPS must be >= 1");
-        }
-
-        Ok(Self { bind, fps })
+        Ok(Self {
+            bind,
+            encoder: EncoderSettings::load()?,
+        })
     }
 }
 
@@ -136,7 +131,7 @@ pub async fn run_webrtc(rdp: ModeBConfig, webrtc: WebRtcConfig) -> anyhow::Resul
     info!(
         target = %rdp.destination_label(),
         bind = %webrtc.bind,
-        fps = webrtc.fps,
+        settings = ?webrtc.encoder,
         "Mode B WebRTC probe starting (server-side auth)"
     );
 
@@ -191,7 +186,7 @@ pub async fn run_webrtc(rdp: ModeBConfig, webrtc: WebRtcConfig) -> anyhow::Resul
     );
 
     let mut encoder =
-        H264Pipeline::build(width, height, webrtc.fps, WEBRTC_TAIL, true).context("build WebRTC pipeline")?;
+        H264Pipeline::build(width, height, &webrtc.encoder, WEBRTC_TAIL, true).context("build WebRTC pipeline")?;
     info!(
         encoder = encoder.encoder_name(),
         hardware = encoder.is_hardware(),
@@ -238,7 +233,7 @@ pub async fn run_webrtc(rdp: ModeBConfig, webrtc: WebRtcConfig) -> anyhow::Resul
         connection_result,
         framed,
         &mut image,
-        webrtc.fps,
+        webrtc.encoder.fps,
         stop,
         Some(input_rx),
         &mut encoder,

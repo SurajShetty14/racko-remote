@@ -41,7 +41,7 @@ jobs:
           RDP_TLS_VERIFY: insecure
           MODEB_ENCODE_PATH: /tmp/modeb-encoded.mp4
           MODEB_ENCODE_DURATION_SECS: "20"
-          MODEB_ENCODE_FPS: "30"
+          MODEB_FPS: "30"
           RUST_LOG: info
         run: |
           set -euo pipefail

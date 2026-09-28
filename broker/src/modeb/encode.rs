@@ -5,7 +5,9 @@
 //! box with an RTX GPU, `nvidia-smi` should show non-zero encoder utilization.
 
 use core::pin::pin;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -24,15 +26,109 @@ use crate::modeb::connect;
 /// Default Linux path for the Mode B encode proof MP4.
 pub const ENCODED_MP4_PATH: &str = "/tmp/modeb-encoded.mp4";
 
-pub(super) const DEFAULT_FPS: u32 = 30;
 const DEFAULT_DURATION_SECS: u64 = 10;
+const DEFAULT_FPS: u32 = 30;
+const MAX_FPS: u32 = 60;
+const DEFAULT_BITRATE_KBPS: u32 = 12_000;
+/// Keyframe interval in frames (1 s at the default 30 fps).
+const GOP_SIZE: u32 = 30;
+/// Frames the live pipeline may buffer ahead of the encoder before dropping the oldest.
+const LIVE_QUEUE_BUFFERS: u32 = 4;
 
-/// Encode-session settings (output path, duration, fps).
+/// `nvh264enc` rate control (`rc-mode`); ignored by the `x264enc` fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateControl {
+    /// Constant bitrate: steady bandwidth and latency, best for live streaming.
+    Cbr,
+    /// Low-delay high-quality CBR.
+    CbrLdHq,
+    /// High-quality CBR.
+    CbrHq,
+    /// Variable bitrate averaging `bitrate`, peaking at 1.5x.
+    Vbr,
+    /// High-quality VBR.
+    VbrHq,
+}
+
+impl RateControl {
+    fn nick(self) -> &'static str {
+        match self {
+            Self::Cbr => "cbr",
+            Self::CbrLdHq => "cbr-ld-hq",
+            Self::CbrHq => "cbr-hq",
+            Self::Vbr => "vbr",
+            Self::VbrHq => "vbr-hq",
+        }
+    }
+
+    fn is_vbr(self) -> bool {
+        matches!(self, Self::Vbr | Self::VbrHq)
+    }
+}
+
+impl core::str::FromStr for RateControl {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "cbr" => Ok(Self::Cbr),
+            "cbr-ld-hq" => Ok(Self::CbrLdHq),
+            "cbr-hq" => Ok(Self::CbrHq),
+            "vbr" => Ok(Self::Vbr),
+            "vbr-hq" => Ok(Self::VbrHq),
+            other => bail!("expected one of cbr, cbr-ld-hq, cbr-hq, vbr, vbr-hq, got {other}"),
+        }
+    }
+}
+
+/// H.264 encoder settings shared by the MP4 and WebRTC probes.
+#[derive(Debug, Clone, Copy)]
+pub struct EncoderSettings {
+    /// Capture and encode rate; the framebuffer is pushed at this rate whether or not RDP updated it.
+    pub fps: u32,
+    pub bitrate_kbps: u32,
+    pub rate_control: RateControl,
+}
+
+impl EncoderSettings {
+    /// `MODEB_FPS` (1..=60, falls back to legacy `MODEB_ENCODE_FPS`), `MODEB_BITRATE_KBPS`, `MODEB_RC_MODE`.
+    pub fn load() -> anyhow::Result<Self> {
+        let file = dotenv_map(broker_dotenv_path());
+        let lookup = |key: &str| std::env::var(key).ok().or_else(|| file.get(key).cloned());
+
+        let fps: u32 = lookup("MODEB_FPS")
+            .or_else(|| lookup("MODEB_ENCODE_FPS"))
+            .map_or(Ok(DEFAULT_FPS), |v| v.parse())
+            .context("MODEB_FPS must be a positive integer")?;
+        if !(1..=MAX_FPS).contains(&fps) {
+            bail!("MODEB_FPS must be between 1 and {MAX_FPS}, got {fps}");
+        }
+
+        let bitrate_kbps: u32 = lookup("MODEB_BITRATE_KBPS")
+            .map_or(Ok(DEFAULT_BITRATE_KBPS), |v| v.parse())
+            .context("MODEB_BITRATE_KBPS must be a positive integer (kbit/s)")?;
+        if bitrate_kbps == 0 {
+            bail!("MODEB_BITRATE_KBPS must be >= 1");
+        }
+
+        let rate_control = lookup("MODEB_RC_MODE")
+            .map_or(Ok(RateControl::Cbr), |v| v.parse())
+            .context("invalid MODEB_RC_MODE")?;
+
+        Ok(Self {
+            fps,
+            bitrate_kbps,
+            rate_control,
+        })
+    }
+}
+
+/// Encode-session settings (output path, duration, encoder).
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
     pub output_path: PathBuf,
     pub duration: Duration,
-    pub fps: u32,
+    pub encoder: EncoderSettings,
 }
 
 impl EncodeConfig {
@@ -52,18 +148,10 @@ impl EncodeConfig {
             bail!("MODEB_ENCODE_DURATION_SECS must be >= 1");
         }
 
-        let fps: u32 = lookup("MODEB_ENCODE_FPS")
-            .unwrap_or_else(|| DEFAULT_FPS.to_string())
-            .parse()
-            .context("MODEB_ENCODE_FPS must be a positive integer")?;
-        if fps == 0 {
-            bail!("MODEB_ENCODE_FPS must be >= 1");
-        }
-
         Ok(Self {
             output_path,
             duration: Duration::from_secs(duration_secs),
-            fps,
+            encoder: EncoderSettings::load()?,
         })
     }
 }
@@ -73,7 +161,7 @@ pub async fn run_encode(rdp: ModeBConfig, encode: EncodeConfig) -> anyhow::Resul
     info!(
         output = %encode.output_path.display(),
         duration_secs = encode.duration.as_secs(),
-        fps = encode.fps,
+        settings = ?encode.encoder,
         "Mode B encode probe starting"
     );
 
@@ -109,7 +197,7 @@ pub async fn run_encode(rdp: ModeBConfig, encode: EncodeConfig) -> anyhow::Resul
          ! filesink name=modeb-sink location=\"{location}\" sync=false"
     );
     let mut encoder =
-        H264Pipeline::build(width, height, encode.fps, &tail, false).context("build H.264 encode pipeline")?;
+        H264Pipeline::build(width, height, &encode.encoder, &tail, false).context("build H.264 encode pipeline")?;
 
     info!(
         encoder = encoder.encoder_name(),
@@ -130,7 +218,7 @@ pub async fn run_encode(rdp: ModeBConfig, encode: EncodeConfig) -> anyhow::Resul
         connection_result,
         framed,
         &mut image,
-        encode.fps,
+        encode.encoder.fps,
         stop,
         None,
         &mut encoder,
@@ -166,13 +254,25 @@ impl EncoderKind {
         matches!(self, Self::NvH264)
     }
 
-    /// Element fragment used inside `gst::parse::launch`; one keyframe per second.
-    fn launch_fragment(self, fps: u32) -> String {
+    /// Element fragment used inside `gst::parse::launch`.
+    fn launch_fragment(self, settings: &EncoderSettings) -> String {
+        // bitrate and max-bitrate are kbit/sec on both encoders.
+        let bitrate = settings.bitrate_kbps;
         match self {
-            // bitrate is kbit/sec on both encoders.
-            Self::NvH264 => format!("nvh264enc preset=low-latency-hq bitrate=4000 gop-size={fps}"),
+            Self::NvH264 => {
+                let rc_mode = settings.rate_control;
+                let max_bitrate = if rc_mode.is_vbr() {
+                    format!(" max-bitrate={}", bitrate.saturating_mul(3) / 2)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "nvh264enc preset=low-latency-hq rc-mode={} bitrate={bitrate}{max_bitrate} gop-size={GOP_SIZE}",
+                    rc_mode.nick()
+                )
+            }
             Self::X264 => {
-                format!("x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max={fps}")
+                format!("x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max={GOP_SIZE}")
             }
         }
     }
@@ -205,16 +305,26 @@ pub(super) struct H264Pipeline {
     fps: u32,
     live: bool,
     frame_index: u64,
+    /// Live pipelines only: the leaky queue and how many times it overflowed (one dropped frame each).
+    queue: Option<(gst::Element, Arc<AtomicU64>)>,
 }
 
 impl H264Pipeline {
     /// Build (but do not start) the pipeline; `tail` is linked after the encoder.
     ///
-    /// A `live` pipeline stamps buffers with the pipeline clock and drops frames
-    /// instead of blocking the RDP decode loop when downstream stalls.
-    /// Otherwise buffers are stamped from the frame index and `push_frame` blocks.
-    pub(super) fn build(width: u16, height: u16, fps: u32, tail: &str, live: bool) -> anyhow::Result<Self> {
+    /// A `live` pipeline stamps buffers with the pipeline clock and, when the
+    /// encoder falls behind, drops the oldest queued frame instead of blocking
+    /// the RDP decode loop. Otherwise buffers are stamped from the frame index
+    /// and `push_frame` blocks.
+    pub(super) fn build(
+        width: u16,
+        height: u16,
+        settings: &EncoderSettings,
+        tail: &str,
+        live: bool,
+    ) -> anyhow::Result<Self> {
         let kind = select_encoder()?;
+        let fps = settings.fps;
         let width_u32 = u32::from(width);
         let height_u32 = u32::from(height);
 
@@ -223,13 +333,18 @@ impl H264Pipeline {
             .build()
             .context("build VideoInfo")?;
 
+        // The queue is empty while the encoder keeps up, so it adds no latency
+        // then; it only fills (up to LIVE_QUEUE_BUFFERS frames) during bursts.
         let (do_timestamp, queue) = if live {
             (
                 "true",
-                "! queue name=modeb-queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 ",
+                format!(
+                    "! queue name=modeb-queue leaky=downstream max-size-buffers={LIVE_QUEUE_BUFFERS} \
+                     max-size-bytes=0 max-size-time=0 "
+                ),
             )
         } else {
-            ("false", "")
+            ("false", String::new())
         };
 
         // Caps are also set on appsrc below so push_buffer validates format/size.
@@ -239,7 +354,7 @@ impl H264Pipeline {
              {queue}! videoconvert name=modeb-convert \
              ! {encoder} name=modeb-enc \
              ! {tail}",
-            encoder = kind.launch_fragment(fps),
+            encoder = kind.launch_fragment(settings),
         );
 
         info!(pipeline = %launch, "Building GStreamer pipeline");
@@ -261,6 +376,19 @@ impl H264Pipeline {
         appsrc.set_max_bytes(u64::from(width_u32) * u64::from(height_u32) * 4 * 4);
         appsrc.set_caps(Some(&video_info.to_caps().context("video caps")?));
 
+        let queue = match pipeline.by_name("modeb-queue") {
+            Some(queue) => {
+                let overruns = Arc::new(AtomicU64::new(0));
+                let counter = Arc::clone(&overruns);
+                queue.connect("overrun", false, move |_| {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    None
+                });
+                Some((queue, overruns))
+            }
+            None => None,
+        };
+
         Ok(Self {
             pipeline,
             appsrc,
@@ -269,6 +397,7 @@ impl H264Pipeline {
             fps,
             live,
             frame_index: 0,
+            queue,
         })
     }
 
@@ -343,11 +472,21 @@ impl H264Pipeline {
 
         self.frame_index = self.frame_index.saturating_add(1);
         if self.frame_index == 1 || self.frame_index.is_multiple_of(u64::from(self.fps) * 2) {
-            info!(
-                frames_pushed = self.frame_index,
-                encoder = self.encoder_name(),
-                "Pushed RGBA frames into encoder"
-            );
+            match &self.queue {
+                Some((queue, overruns)) => info!(
+                    frames_pushed = self.frame_index,
+                    encoder = self.encoder_name(),
+                    queue_level = queue.property::<u32>("current-level-buffers"),
+                    queue_max = LIVE_QUEUE_BUFFERS,
+                    frames_dropped = overruns.load(Ordering::Relaxed),
+                    "Pushed RGBA frames into encoder"
+                ),
+                None => info!(
+                    frames_pushed = self.frame_index,
+                    encoder = self.encoder_name(),
+                    "Pushed RGBA frames into encoder"
+                ),
+            }
         }
 
         drain_bus(&self.pipeline)?;

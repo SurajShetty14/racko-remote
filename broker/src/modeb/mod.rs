@@ -19,6 +19,6 @@ pub use connect::{ModeBConfig, run};
 pub use framebuffer::FRAME_PNG_PATH;
 
 #[cfg(feature = "modeb-encode")]
-pub use encode::{ENCODED_MP4_PATH, EncodeConfig, run_encode};
+pub use encode::{ENCODED_MP4_PATH, EncodeConfig, EncoderSettings, RateControl, run_encode};
 #[cfg(feature = "modeb-encode")]
 pub use webrtc::{WebRtcConfig, run_webrtc};

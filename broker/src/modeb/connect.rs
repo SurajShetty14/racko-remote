@@ -440,8 +440,11 @@ pub(super) async fn active_session_encode(
                 ActiveStageOutput::GraphicsUpdate(region) => {
                     update_count = update_count.saturating_add(1);
                     if update_count == 1 || update_count.is_multiple_of(50) {
+                        // Compare with the encode fps: pushing faster than RDP updates only repeats frames.
+                        let updates_per_sec = update_count as f64 / started.elapsed().as_secs_f64().max(1e-3);
                         info!(
                             update_count,
+                            updates_per_sec = format!("{updates_per_sec:.1}"),
                             left = region.left,
                             top = region.top,
                             right = region.right,
