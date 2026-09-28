@@ -126,9 +126,17 @@ pub async fn run_encode(rdp: ModeBConfig, encode: EncodeConfig) -> anyhow::Resul
         tokio::time::sleep(duration).await;
         Ok::<_, anyhow::Error>("encode duration elapsed")
     });
-    connect::active_session_encode(connection_result, framed, &mut image, encode.fps, stop, &mut encoder)
-        .await
-        .context("Mode B encode session")?;
+    connect::active_session_encode(
+        connection_result,
+        framed,
+        &mut image,
+        encode.fps,
+        stop,
+        None,
+        &mut encoder,
+    )
+    .await
+    .context("Mode B encode session")?;
 
     info!(
         frames_pushed = encoder.frames_pushed(),

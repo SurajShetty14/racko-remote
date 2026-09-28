@@ -338,6 +338,9 @@ async fn active_session_png(
 
 /// Decode the session and push the framebuffer to `sink` at `fps` until the
 /// server terminates or `stop` resolves (`Ok(reason)` ends the session cleanly).
+///
+/// Each `input` message is one transaction of browser operations, written to
+/// the server as fast-path input between graphics reads.
 #[cfg(feature = "modeb-encode")]
 pub(super) async fn active_session_encode(
     connection_result: ConnectionResult,
@@ -345,6 +348,7 @@ pub(super) async fn active_session_encode(
     image: &mut DecodedImage,
     fps: u32,
     mut stop: core::pin::Pin<&mut dyn core::future::Future<Output = anyhow::Result<&'static str>>>,
+    mut input: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<ironrdp_input::Operation>>>,
     sink: &mut dyn super::encode::EncodeSink,
 ) -> anyhow::Result<()> {
     let (mut reader, mut writer) = ironrdp_tokio::split_tokio_framed(framed);
@@ -367,63 +371,53 @@ pub(super) async fn active_session_encode(
     // Fire immediately so the first encoded frame is not delayed by one period.
     push.tick().await;
 
+    let mut input_db = ironrdp_input::Database::new();
     let mut update_count: u64 = 0;
     let mut frame_count: u64 = 0;
     let started = Instant::now();
 
-    info!(fps, "Active session started; pushing RGBA to H.264 encoder");
+    info!(
+        fps,
+        input = input.is_some(),
+        "Active session started; pushing RGBA to H.264 encoder"
+    );
 
     loop {
-        tokio::select! {
+        let outputs = tokio::select! {
             frame = reader.read_pdu() => {
                 let (action, payload) = frame.context("read PDU")?;
                 frame_count = frame_count.saturating_add(1);
                 trace!(?action, frame_length = payload.len(), frame_count, "Frame received");
 
-                let outputs = active_stage
+                active_stage
                     .process(image, action, &payload)
-                    .context("active stage process")?;
-
-                for out in outputs {
-                    match out {
-                        ActiveStageOutput::ResponseFrame(response) => {
-                            writer.write_all(&response).await.context("write response")?;
-                        }
-                        ActiveStageOutput::GraphicsUpdate(region) => {
-                            update_count = update_count.saturating_add(1);
-                            if update_count == 1 || update_count.is_multiple_of(50) {
-                                info!(
-                                    update_count,
-                                    left = region.left,
-                                    top = region.top,
-                                    right = region.right,
-                                    bottom = region.bottom,
-                                    "Graphics update"
-                                );
-                            }
-                        }
-                        ActiveStageOutput::Terminate(reason) => {
-                            info!(
-                                ?reason,
-                                update_count,
-                                frame_count,
-                                elapsed_secs = started.elapsed().as_secs(),
-                                "Session terminated"
-                            );
-                            return Ok(());
-                        }
-                        ActiveStageOutput::DeactivateAll => {
-                            warn!("Server sent Deactivate All; Mode B does not reactivate");
-                        }
-                        ActiveStageOutput::SaveSessionInfo { logon_complete } => {
-                            info!(logon_complete, "Save session info");
-                        }
-                        _ => {}
-                    }
+                    .context("active stage process")?
+            }
+            ops = async {
+                match input.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => core::future::pending().await,
                 }
+            } => {
+                let events = match ops {
+                    Some(ops) => {
+                        debug!(?ops, "Applying browser input");
+                        input_db.apply(ops)
+                    }
+                    None => {
+                        info!("Browser input channel closed; releasing held keys and buttons");
+                        input = None;
+                        input_db.release_all()
+                    }
+                };
+                debug!(event_count = events.len(), "Sending fast-path input");
+                active_stage
+                    .process_fastpath_input(image, &events)
+                    .context("encode fast-path input")?
             }
             _ = push.tick() => {
                 sink.push_frame(image).context("push frame to encoder")?;
+                continue;
             }
             reason = stop.as_mut() => {
                 let reason = reason?;
@@ -435,6 +429,44 @@ pub(super) async fn active_session_encode(
                     "Stopping RDP session"
                 );
                 return Ok(());
+            }
+        };
+
+        for out in outputs {
+            match out {
+                ActiveStageOutput::ResponseFrame(response) => {
+                    writer.write_all(&response).await.context("write response")?;
+                }
+                ActiveStageOutput::GraphicsUpdate(region) => {
+                    update_count = update_count.saturating_add(1);
+                    if update_count == 1 || update_count.is_multiple_of(50) {
+                        info!(
+                            update_count,
+                            left = region.left,
+                            top = region.top,
+                            right = region.right,
+                            bottom = region.bottom,
+                            "Graphics update"
+                        );
+                    }
+                }
+                ActiveStageOutput::Terminate(reason) => {
+                    info!(
+                        ?reason,
+                        update_count,
+                        frame_count,
+                        elapsed_secs = started.elapsed().as_secs(),
+                        "Session terminated"
+                    );
+                    return Ok(());
+                }
+                ActiveStageOutput::DeactivateAll => {
+                    warn!("Server sent Deactivate All; Mode B does not reactivate");
+                }
+                ActiveStageOutput::SaveSessionInfo { logon_complete } => {
+                    info!(logon_complete, "Save session info");
+                }
+                _ => {}
             }
         }
     }

@@ -5,12 +5,13 @@
   <title>Racko Mode B WebRTC test</title>
   <style>
     body { margin: 0; background: #111; color: #ddd; font: 13px/1.4 monospace; }
-    video { display: block; max-width: 100vw; max-height: 75vh; margin: 0 auto; background: #000; }
+    video { display: block; max-width: 100vw; max-height: 75vh; margin: 0 auto; background: #000; cursor: default; }
+    video:focus { outline: 2px solid #4a8; }
     #log { height: 25vh; overflow-y: auto; margin: 0; padding: 6px 10px; white-space: pre-wrap; }
   </style>
 </head>
 <body>
-  <video id="video" autoplay muted playsinline></video>
+  <video id="video" autoplay muted playsinline tabindex="0"></video>
   <pre id="log"></pre>
   <script>
     const video = document.getElementById('video');
@@ -27,8 +28,19 @@
     const ws = new WebSocket(wsUrl);
     const send = (msg) => ws.send(JSON.stringify(msg));
 
-    // Host candidates only: no STUN/TURN for the local Phase 3a test.
+    // Host candidates only: no STUN/TURN for the local test.
     const pc = new RTCPeerConnection({ iceServers: [] });
+
+    // Input back-channel. The broker's webrtcbin creates the same pre-negotiated
+    // channel (label "input", id 0) before its offer, so it is in the SDP; creating
+    // it here before the answer binds this side to that SCTP stream.
+    const input = pc.createDataChannel('input', { ordered: true, negotiated: true, id: 0 });
+    input.onopen = () => log('input channel open (click the video to control the desktop)');
+    input.onclose = () => log('input channel closed');
+    input.onerror = (ev) => log('input channel error:', ev.error?.message ?? ev);
+    const sendInput = (msg) => {
+      if (input.readyState === 'open') input.send(JSON.stringify(msg));
+    };
 
     pc.onsignalingstatechange = () => log('signaling state:', pc.signalingState);
     pc.onicegatheringstatechange = () => log('ICE gathering state:', pc.iceGatheringState);
@@ -77,6 +89,64 @@
         log('signaling handling failed:', err);
       }
     };
+
+    // --- Input capture -------------------------------------------------------
+
+    // Map a pointer event to desktop pixels (videoWidth x videoHeight is the RDP
+    // desktop size), accounting for letterboxing from the default object-fit: contain.
+    function desktopPoint(ev) {
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      if (!vw || !vh) return null;
+      const rect = video.getBoundingClientRect();
+      const scale = Math.min(rect.width / vw, rect.height / vh);
+      const left = rect.left + (rect.width - vw * scale) / 2;
+      const top = rect.top + (rect.height - vh * scale) / 2;
+      const clamp = (v, max) => Math.min(Math.max(Math.round(v), 0), max - 1);
+      return { x: clamp((ev.clientX - left) / scale, vw), y: clamp((ev.clientY - top) / scale, vh) };
+    }
+
+    const BUTTONS = ['left', 'middle', 'right'];
+
+    // Throttle mousemove to one message per animation frame (~60 fps).
+    let pendingMove = null;
+    let moveScheduled = false;
+    video.addEventListener('mousemove', (ev) => {
+      pendingMove = desktopPoint(ev);
+      if (moveScheduled) return;
+      moveScheduled = true;
+      requestAnimationFrame(() => {
+        moveScheduled = false;
+        if (pendingMove) sendInput({ type: 'mousemove', ...pendingMove });
+        pendingMove = null;
+      });
+    });
+
+    for (const type of ['mousedown', 'mouseup']) {
+      video.addEventListener(type, (ev) => {
+        if (type === 'mousedown') video.focus();
+        const button = BUTTONS[ev.button];
+        const point = desktopPoint(ev);
+        if (!button || !point) return;
+        ev.preventDefault();
+        pendingMove = null;
+        sendInput({ type, button, ...point });
+      });
+    }
+
+    video.addEventListener('contextmenu', (ev) => ev.preventDefault());
+
+    video.addEventListener('wheel', (ev) => {
+      ev.preventDefault();
+      sendInput({ type: 'wheel', deltaX: ev.deltaX, deltaY: ev.deltaY, deltaMode: ev.deltaMode });
+    }, { passive: false });
+
+    for (const type of ['keydown', 'keyup']) {
+      video.addEventListener(type, (ev) => {
+        ev.preventDefault();
+        sendInput(type === 'keydown' ? { type, code: ev.code, repeat: ev.repeat } : { type, code: ev.code });
+      });
+    }
 
     window.addEventListener('beforeunload', () => { ws.close(); pc.close(); });
   </script>

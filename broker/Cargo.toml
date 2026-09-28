@@ -39,6 +39,7 @@ modeb-encode = [
     "dep:gstreamer-sdp",
     "dep:gstreamer-video",
     "dep:gstreamer-webrtc",
+    "dep:ironrdp-input",
     "axum/ws",
 ]
 
@@ -52,11 +53,12 @@ gstreamer = { version = "0.24", optional = true }
 gstreamer-app = { version = "0.24", optional = true }
 gstreamer-sdp = { version = "0.24", optional = true }
 gstreamer-video = { version = "0.24", optional = true }
-gstreamer-webrtc = { version = "0.24", optional = true }
+gstreamer-webrtc = { version = "0.24", optional = true, features = ["v1_18"] } # WebRTCDataChannel
 image = { version = "0.25", default-features = false, features = ["png"] }
 ironrdp-connector = { path = "../crates/ironrdp-connector" }
 ironrdp-core = { path = "../crates/ironrdp-core", features = ["std"] }
 ironrdp-graphics = { path = "../crates/ironrdp-graphics" }
+ironrdp-input = { path = "../crates/ironrdp-input", optional = true }
 ironrdp-pdu = { path = "../crates/ironrdp-pdu", features = ["std"] }
 ironrdp-rdcleanpath = { path = "../crates/ironrdp-rdcleanpath" }
 ironrdp-session = { path = "../crates/ironrdp-session" }

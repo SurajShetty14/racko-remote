@@ -9,6 +9,11 @@
 //! No STUN/TURN is configured, so only host candidates are gathered and the
 //! browser must reach the box directly (Phase 3a tests from the box itself).
 //!
+//! Phase 4 adds an ordered `input` data channel (pre-negotiated, id 0) carrying
+//! browser mouse/keyboard JSON back to the RDP session (see [`super::input`]).
+//! webrtcbin creates it before the first offer so the SDP has an `m=application`
+//! section; the page creates the matching channel before answering.
+//!
 //! [webrtc sendrecv example]: https://gitlab.freedesktop.org/gstreamer/gstreamer/-/tree/main/subprojects/gst-examples/webrtc/sendrecv
 
 use core::net::SocketAddr;
@@ -28,6 +33,7 @@ use gstreamer::prelude::*;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use ironrdp_graphics::image_processing::PixelFormat;
+use ironrdp_input::Operation;
 use ironrdp_session::image::DecodedImage;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -37,6 +43,11 @@ use crate::config::{broker_dotenv_path, dotenv_map};
 use crate::modeb::ModeBConfig;
 use crate::modeb::connect;
 use crate::modeb::encode::{DEFAULT_FPS, H264Pipeline};
+use crate::modeb::input::InputTranslator;
+
+/// Label and pre-negotiated SCTP stream id of the browser input channel (must match `modeb.html`).
+const INPUT_CHANNEL_LABEL: &str = "input";
+const INPUT_CHANNEL_ID: i32 = 0;
 
 const MODEB_HTML: &str = include_str!("../../static/modeb.html");
 
@@ -61,6 +72,8 @@ const REQUIRED_ELEMENTS: &[&str] = &[
     "nicesink",
     "dtlssrtpenc",
     "srtpenc",
+    "sctpenc",
+    "sctpdec",
 ];
 
 /// WebRTC probe settings.
@@ -189,6 +202,22 @@ pub async fn run_webrtc(rdp: ModeBConfig, webrtc: WebRtcConfig) -> anyhow::Resul
         .pipeline()
         .by_name("modeb-webrtc")
         .context("pipeline missing modeb-webrtc")?;
+    let translator = Arc::new(InputTranslator::new(width, height).context("load keyboard scancode table")?);
+    info!(
+        key_codes = translator.key_count(),
+        "Loaded web client KeyboardEvent.code to scancode table"
+    );
+
+    // webrtcbin only creates data channels from READY; doing it before PLAYING
+    // puts the channel in the first offer instead of forcing a renegotiation.
+    encoder
+        .pipeline()
+        .set_state(gst::State::Ready)
+        .context("set pipeline Ready")?;
+    let (input_tx, input_rx) = mpsc::unbounded_channel();
+    let _input_channel = connect_input_channels(&webrtcbin, &translator, &input_tx)?;
+    drop(input_tx);
+
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     connect_webrtcbin_signals(&webrtcbin, &events_tx);
     drop(events_tx);
@@ -205,9 +234,17 @@ pub async fn run_webrtc(rdp: ModeBConfig, webrtc: WebRtcConfig) -> anyhow::Resul
     });
 
     let mut image = DecodedImage::new(PixelFormat::RgbA32, width, height);
-    let result = connect::active_session_encode(connection_result, framed, &mut image, webrtc.fps, stop, &mut encoder)
-        .await
-        .context("Mode B WebRTC session");
+    let result = connect::active_session_encode(
+        connection_result,
+        framed,
+        &mut image,
+        webrtc.fps,
+        stop,
+        Some(input_rx),
+        &mut encoder,
+    )
+    .await
+    .context("Mode B WebRTC session");
 
     info!(frames_pushed = encoder.frames_pushed(), "Mode B WebRTC session ended");
     drop(encoder);
@@ -355,6 +392,76 @@ fn connect_webrtcbin_signals(webrtcbin: &gst::Element, events: &mpsc::UnboundedS
         info!(?state, "Peer connection state changed");
         if state == gst_webrtc::WebRTCPeerConnectionState::Failed {
             let _ = tx.send(PeerEvent::Failed("peer connection failed".to_owned()));
+        }
+    });
+}
+
+/// Create the pre-negotiated `input` channel and accept an in-band one from the
+/// browser too (`on-data-channel`); both feed translated operations into `input`.
+fn connect_input_channels(
+    webrtcbin: &gst::Element,
+    translator: &Arc<InputTranslator>,
+    input: &mpsc::UnboundedSender<Vec<Operation>>,
+) -> anyhow::Result<gst_webrtc::WebRTCDataChannel> {
+    let options = gst::Structure::builder("input-channel-options")
+        .field("ordered", true)
+        .field("negotiated", true)
+        .field("id", INPUT_CHANNEL_ID)
+        .build();
+    let channel = webrtcbin
+        .emit_by_name::<Option<gst_webrtc::WebRTCDataChannel>>("create-data-channel", &[&INPUT_CHANNEL_LABEL, &options])
+        .context("webrtcbin did not create the input data channel")?;
+    info!(
+        label = INPUT_CHANNEL_LABEL,
+        id = INPUT_CHANNEL_ID,
+        "Created pre-negotiated input data channel"
+    );
+    attach_input_channel(&channel, translator, input);
+
+    let translator = Arc::clone(translator);
+    let input = input.clone();
+    webrtcbin.connect_closure(
+        "on-data-channel",
+        false,
+        glib::closure!(
+            move |_webrtcbin: &gst::Element, channel: &gst_webrtc::WebRTCDataChannel| {
+                let label = channel.label();
+                if label.as_deref() == Some(INPUT_CHANNEL_LABEL) {
+                    info!(?label, "Browser opened an in-band input data channel");
+                    attach_input_channel(channel, &translator, &input);
+                } else {
+                    warn!(?label, "Ignoring unexpected data channel from browser");
+                }
+            }
+        ),
+    );
+
+    Ok(channel)
+}
+
+fn attach_input_channel(
+    channel: &gst_webrtc::WebRTCDataChannel,
+    translator: &Arc<InputTranslator>,
+    input: &mpsc::UnboundedSender<Vec<Operation>>,
+) {
+    channel.connect_on_open(|channel| info!(label = ?channel.label(), "Input data channel open"));
+    channel.connect_on_close(|channel| info!(label = ?channel.label(), "Input data channel closed"));
+    channel.connect_on_error(|channel, err| {
+        warn!(label = ?channel.label(), error = %err, "Input data channel error");
+    });
+
+    let translator = Arc::clone(translator);
+    let input = input.clone();
+    channel.connect_on_message_string(move |_channel, msg| {
+        let Some(msg) = msg else {
+            return;
+        };
+        match translator.translate(msg) {
+            Ok(ops) if ops.is_empty() => {}
+            Ok(ops) => {
+                let _ = input.send(ops);
+            }
+            Err(err) => warn!(error = %format!("{err:#}"), msg_len = msg.len(), "Ignoring malformed input message"),
         }
     });
 }

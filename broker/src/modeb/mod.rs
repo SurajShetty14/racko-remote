@@ -3,12 +3,15 @@
 //! - Phase 1 (`modeb_probe`): PNG proof dumps of the RGBA framebuffer.
 //! - Phase 2 (`modeb_encode_probe`, feature `modeb-encode`): H.264 via GStreamer NVENC.
 //! - Phase 3a (`modeb_webrtc_probe`, feature `modeb-encode`): live H.264 over WebRTC.
+//! - Phase 4 (same probe): browser mouse/keyboard back to RDP over a WebRTC data channel.
 
 mod connect;
 mod framebuffer;
 
 #[cfg(feature = "modeb-encode")]
 mod encode;
+#[cfg(feature = "modeb-encode")]
+mod input;
 #[cfg(feature = "modeb-encode")]
 mod webrtc;
 
