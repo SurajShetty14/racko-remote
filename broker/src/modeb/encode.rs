@@ -8,7 +8,7 @@ use core::pin::pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use gstreamer as gst;
@@ -29,11 +29,13 @@ pub const ENCODED_MP4_PATH: &str = "/tmp/modeb-encoded.mp4";
 const DEFAULT_DURATION_SECS: u64 = 10;
 const DEFAULT_FPS: u32 = 30;
 const MAX_FPS: u32 = 60;
-const DEFAULT_BITRATE_KBPS: u32 = 12_000;
-/// Keyframe interval in frames (1 s at the default 30 fps).
-const GOP_SIZE: u32 = 30;
+const DEFAULT_BITRATE_KBPS: u32 = 20_000;
+/// NVENC `aq-strength` range; 0 lets the driver pick.
+const MAX_AQ_STRENGTH: u32 = 15;
 /// Frames the live pipeline may buffer ahead of the encoder before dropping the oldest.
 const LIVE_QUEUE_BUFFERS: u32 = 4;
+/// Interval of the "Encoder stats" log line.
+const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// `nvh264enc` rate control (`rc-mode`); ignored by the `x264enc` fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +83,30 @@ impl core::str::FromStr for RateControl {
     }
 }
 
+/// Where RGBA is converted to the encoder's YUV input (`MODEB_CONVERT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorConvert {
+    /// GPU when `cudaupload`/`cudaconvert` exist and the encoder is NVENC, otherwise CPU.
+    Auto,
+    /// `videoconvert` on the CPU.
+    Cpu,
+    /// `cudaupload ! cudaconvert` to NV12 in CUDA memory.
+    Gpu,
+}
+
+impl core::str::FromStr for ColorConvert {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "cpu" => Ok(Self::Cpu),
+            "gpu" => Ok(Self::Gpu),
+            other => bail!("expected one of auto, cpu, gpu, got {other}"),
+        }
+    }
+}
+
 /// H.264 encoder settings shared by the MP4 and WebRTC probes.
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderSettings {
@@ -88,10 +114,17 @@ pub struct EncoderSettings {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub rate_control: RateControl,
+    /// NVENC adaptive quantization; ignored by the `x264enc` fallback.
+    pub spatial_aq: bool,
+    pub temporal_aq: bool,
+    /// 1 (gentle) to 15 (aggressive); 0 lets the driver pick.
+    pub aq_strength: u32,
+    pub convert: ColorConvert,
 }
 
 impl EncoderSettings {
-    /// `MODEB_FPS` (1..=60, falls back to legacy `MODEB_ENCODE_FPS`), `MODEB_BITRATE_KBPS`, `MODEB_RC_MODE`.
+    /// `MODEB_FPS` (1..=60, falls back to legacy `MODEB_ENCODE_FPS`), `MODEB_BITRATE_KBPS`,
+    /// `MODEB_RC_MODE`, `MODEB_SPATIAL_AQ`, `MODEB_TEMPORAL_AQ`, `MODEB_AQ_STRENGTH`, `MODEB_CONVERT`.
     pub fn load() -> anyhow::Result<Self> {
         let file = dotenv_map(broker_dotenv_path());
         let lookup = |key: &str| std::env::var(key).ok().or_else(|| file.get(key).cloned());
@@ -112,13 +145,39 @@ impl EncoderSettings {
         }
 
         let rate_control = lookup("MODEB_RC_MODE")
-            .map_or(Ok(RateControl::Cbr), |v| v.parse())
+            .map_or(Ok(RateControl::Vbr), |v| v.parse())
             .context("invalid MODEB_RC_MODE")?;
+
+        let flag = |key: &str, default: bool| -> anyhow::Result<bool> {
+            match lookup(key).as_deref() {
+                None => Ok(default),
+                Some("true" | "1") => Ok(true),
+                Some("false" | "0") => Ok(false),
+                Some(other) => bail!("{key} must be true or false, got {other}"),
+            }
+        };
+        let spatial_aq = flag("MODEB_SPATIAL_AQ", true)?;
+        let temporal_aq = flag("MODEB_TEMPORAL_AQ", false)?;
+
+        let aq_strength: u32 = lookup("MODEB_AQ_STRENGTH")
+            .map_or(Ok(0), |v| v.parse())
+            .context("MODEB_AQ_STRENGTH must be an integer")?;
+        if MAX_AQ_STRENGTH < aq_strength {
+            bail!("MODEB_AQ_STRENGTH must be between 0 and {MAX_AQ_STRENGTH}, got {aq_strength}");
+        }
+
+        let convert = lookup("MODEB_CONVERT")
+            .map_or(Ok(ColorConvert::Auto), |v| v.parse())
+            .context("invalid MODEB_CONVERT")?;
 
         Ok(Self {
             fps,
             bitrate_kbps,
             rate_control,
+            spatial_aq,
+            temporal_aq,
+            aq_strength,
+            convert,
         })
     }
 }
@@ -258,6 +317,8 @@ impl EncoderKind {
     fn launch_fragment(self, settings: &EncoderSettings) -> String {
         // bitrate and max-bitrate are kbit/sec on both encoders.
         let bitrate = settings.bitrate_kbps;
+        // One keyframe per second at any fps.
+        let gop = settings.fps;
         match self {
             Self::NvH264 => {
                 let rc_mode = settings.rate_control;
@@ -267,12 +328,12 @@ impl EncoderKind {
                     String::new()
                 };
                 format!(
-                    "nvh264enc preset=low-latency-hq rc-mode={} bitrate={bitrate}{max_bitrate} gop-size={GOP_SIZE}",
+                    "nvh264enc preset=low-latency-hq rc-mode={} bitrate={bitrate}{max_bitrate} gop-size={gop}",
                     rc_mode.nick()
                 )
             }
             Self::X264 => {
-                format!("x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max={GOP_SIZE}")
+                format!("x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max={gop}")
             }
         }
     }
@@ -294,7 +355,25 @@ fn select_encoder() -> anyhow::Result<EncoderKind> {
     }
 }
 
-/// appsrc(RGBA) → [leaky queue] → videoconvert → {nvh264enc|x264enc} → `tail`
+/// Encoded output, counted by a probe on the encoder's src pad.
+#[derive(Default)]
+struct EncodedCounters {
+    bytes: AtomicU64,
+    frames: AtomicU64,
+    keyframes: AtomicU64,
+}
+
+/// Counter values at the previous "Encoder stats" line.
+struct StatsWindow {
+    at: Instant,
+    pushed: u64,
+    encoded_bytes: u64,
+    encoded_frames: u64,
+    keyframes: u64,
+    dropped: u64,
+}
+
+/// appsrc(RGBA) → [leaky queue] → {videoconvert|cudaupload → cudaconvert} → {nvh264enc|x264enc} → `tail`
 ///
 /// The pipeline is set to NULL on drop.
 pub(super) struct H264Pipeline {
@@ -302,11 +381,16 @@ pub(super) struct H264Pipeline {
     appsrc: gst_app::AppSrc,
     video_info: gst_video::VideoInfo,
     kind: EncoderKind,
-    fps: u32,
+    settings: EncoderSettings,
+    /// `"cpu"` or `"gpu"`: where RGBA is converted for the encoder.
+    convert: &'static str,
     live: bool,
     frame_index: u64,
     /// Live pipelines only: the leaky queue and how many times it overflowed (one dropped frame each).
     queue: Option<(gst::Element, Arc<AtomicU64>)>,
+    encoded: Arc<EncodedCounters>,
+    window: StatsWindow,
+    input_caps_logged: bool,
 }
 
 impl H264Pipeline {
@@ -347,11 +431,35 @@ impl H264Pipeline {
             ("false", String::new())
         };
 
+        let has_cuda_convert = ["cudaupload", "cudaconvert"]
+            .iter()
+            .all(|name| gst::ElementFactory::find(name).is_some());
+        let gpu_convert = match settings.convert {
+            ColorConvert::Cpu => false,
+            ColorConvert::Auto => kind.is_hardware() && has_cuda_convert,
+            ColorConvert::Gpu if kind.is_hardware() && has_cuda_convert => true,
+            ColorConvert::Gpu => {
+                warn!(
+                    encoder = kind.element_name(),
+                    has_cuda_convert,
+                    "MODEB_CONVERT=gpu needs nvh264enc, cudaupload and cudaconvert; using videoconvert"
+                );
+                false
+            }
+        };
+        let convert_label = if gpu_convert { "gpu" } else { "cpu" };
+        let convert = if gpu_convert {
+            "cudaupload name=modeb-upload ! cudaconvert name=modeb-convert \
+             ! video/x-raw(memory:CUDAMemory),format=NV12"
+        } else {
+            "videoconvert name=modeb-convert"
+        };
+
         // Caps are also set on appsrc below so push_buffer validates format/size.
         let launch = format!(
             "appsrc name=modeb-src is-live=true format=time do-timestamp={do_timestamp} \
              caps=video/x-raw,format=RGBA,width={width_u32},height={height_u32},framerate={fps}/1 \
-             {queue}! videoconvert name=modeb-convert \
+             {queue}! {convert} \
              ! {encoder} name=modeb-enc \
              ! {tail}",
             encoder = kind.launch_fragment(settings),
@@ -389,15 +497,78 @@ impl H264Pipeline {
             None => None,
         };
 
+        let enc = pipeline.by_name("modeb-enc").context("pipeline missing modeb-enc")?;
+        if kind == EncoderKind::NvH264 {
+            // Set here rather than in the launch string: older nvcodec builds lack some of these,
+            // and an unknown property there fails the whole pipeline.
+            for (name, value) in [
+                ("spatial-aq", settings.spatial_aq.to_value()),
+                ("temporal-aq", settings.temporal_aq.to_value()),
+                ("aq-strength", settings.aq_strength.to_value()),
+            ] {
+                match enc.find_property(name) {
+                    Some(pspec) if pspec.value_type() == value.type_() => enc.set_property_from_value(name, &value),
+                    _ => warn!(property = name, "nvh264enc has no such property; skipping"),
+                }
+            }
+            // Read back from the element, so the log shows what NVENC actually uses.
+            let read = |name: &str| enc.find_property(name).map(|_| enc.property_value(name));
+            let read_bool = |name: &str| read(name).and_then(|value| value.get::<bool>().ok());
+            let read_u32 = |name: &str| read(name).and_then(|value| value.get::<u32>().ok());
+            info!(
+                rc_mode = settings.rate_control.nick(),
+                bitrate_kbps = settings.bitrate_kbps,
+                spatial_aq = ?read_bool("spatial-aq"),
+                temporal_aq = ?read_bool("temporal-aq"),
+                aq_strength = ?read_u32("aq-strength"),
+                bframes = ?read_u32("bframes"),
+                rc_lookahead = ?read_u32("rc-lookahead"),
+                gop = fps,
+                convert = convert_label,
+                "Configured NVENC"
+            );
+        }
+
+        let encoded = Arc::new(EncodedCounters::default());
+        {
+            let encoded = Arc::clone(&encoded);
+            enc.static_pad("src").context("modeb-enc has no src pad")?.add_probe(
+                gst::PadProbeType::BUFFER,
+                move |_pad, info| {
+                    if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data {
+                        encoded
+                            .bytes
+                            .fetch_add(u64::try_from(buffer.size()).unwrap_or(u64::MAX), Ordering::Relaxed);
+                        encoded.frames.fetch_add(1, Ordering::Relaxed);
+                        if !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT) {
+                            encoded.keyframes.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            );
+        }
+
         Ok(Self {
             pipeline,
             appsrc,
             video_info,
             kind,
-            fps,
+            settings: *settings,
+            convert: convert_label,
             live,
             frame_index: 0,
             queue,
+            encoded,
+            window: StatsWindow {
+                at: Instant::now(),
+                pushed: 0,
+                encoded_bytes: 0,
+                encoded_frames: 0,
+                keyframes: 0,
+                dropped: 0,
+            },
+            input_caps_logged: false,
         })
     }
 
@@ -451,7 +622,7 @@ impl H264Pipeline {
         let mut buffer = gst::Buffer::with_size(self.video_info.size()).context("allocate gst buffer")?;
         {
             let buffer = buffer.get_mut().context("gst buffer is not writable")?;
-            let frame_ns = 1_000_000_000 / u64::from(self.fps);
+            let frame_ns = 1_000_000_000 / u64::from(self.settings.fps);
             if !self.live {
                 let pts =
                     gst::ClockTime::from_nseconds(self.frame_index.checked_mul(frame_ns).context("pts overflow")?);
@@ -477,22 +648,60 @@ impl H264Pipeline {
         }
 
         self.frame_index = self.frame_index.saturating_add(1);
-        if self.frame_index == 1 || self.frame_index.is_multiple_of(u64::from(self.fps) * 2) {
-            match &self.queue {
-                Some((queue, overruns)) => info!(
-                    frames_pushed = self.frame_index,
-                    encoder = self.encoder_name(),
-                    queue_level = queue.property::<u32>("current-level-buffers"),
-                    queue_max = LIVE_QUEUE_BUFFERS,
-                    frames_dropped = overruns.load(Ordering::Relaxed),
-                    "Pushed RGBA frames into encoder"
-                ),
-                None => info!(
-                    frames_pushed = self.frame_index,
-                    encoder = self.encoder_name(),
-                    "Pushed RGBA frames into encoder"
-                ),
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.window.at);
+        if STATS_INTERVAL <= elapsed {
+            if !self.input_caps_logged {
+                // RGBA here means the converter passed frames through and NVENC converts them itself.
+                let caps = self
+                    .pipeline
+                    .by_name("modeb-enc")
+                    .and_then(|enc| enc.static_pad("sink"))
+                    .and_then(|pad| pad.current_caps());
+                if let Some(caps) = caps {
+                    info!(convert = self.convert, %caps, "Encoder input negotiated");
+                    self.input_caps_logged = true;
+                }
             }
+
+            let secs = elapsed.as_secs_f64();
+            let per_sec = |delta: u64| format!("{:.1}", delta as f64 / secs);
+            let encoded_bytes = self.encoded.bytes.load(Ordering::Relaxed);
+            let encoded_frames = self.encoded.frames.load(Ordering::Relaxed);
+            let keyframes = self.encoded.keyframes.load(Ordering::Relaxed);
+            let dropped = self
+                .queue
+                .as_ref()
+                .map_or(0, |(_, overruns)| overruns.load(Ordering::Relaxed));
+            let queue_level = self
+                .queue
+                .as_ref()
+                .map(|(queue, _)| queue.property::<u32>("current-level-buffers"));
+            let encoded_kbps = (encoded_bytes - self.window.encoded_bytes) as f64 * 8.0 / 1000.0 / secs;
+            info!(
+                encoder = self.encoder_name(),
+                convert = self.convert,
+                rc_mode = self.settings.rate_control.nick(),
+                target_kbps = self.settings.bitrate_kbps,
+                encoded_kbps = format!("{encoded_kbps:.0}"),
+                pushed_fps = per_sec(self.frame_index - self.window.pushed),
+                encoded_fps = per_sec(encoded_frames - self.window.encoded_frames),
+                keyframes = keyframes - self.window.keyframes,
+                queue_level = ?queue_level,
+                queue_max = LIVE_QUEUE_BUFFERS,
+                dropped = dropped - self.window.dropped,
+                dropped_total = dropped,
+                "Encoder stats"
+            );
+            self.window = StatsWindow {
+                at: now,
+                pushed: self.frame_index,
+                encoded_bytes,
+                encoded_frames,
+                keyframes,
+                dropped,
+            };
         }
 
         drain_bus(&self.pipeline)?;

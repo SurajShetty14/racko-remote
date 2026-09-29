@@ -55,6 +55,59 @@ export function ModeBSession() {
     };
   }, [request]);
 
+  // Tells bitrate starvation (high QP) apart from loss (packetsLost, pliCount) and decode drops.
+  const connected = state.peer === 'connected';
+  useEffect(() => {
+    if (!connected) {
+      return;
+    }
+    type Sample = { at: number; bytes: number; frames: number; qpSum: number; jbDelay: number; jbEmitted: number };
+    let previous: Sample | null = null;
+    const timer = window.setInterval(() => {
+      void sessionRef.current
+        ?.getStats()
+        .then((report) => {
+          report.forEach((entry) => {
+            if (entry.type !== 'inbound-rtp' || entry.kind !== 'video') {
+              return;
+            }
+            const now: Sample = {
+              at: entry.timestamp,
+              bytes: entry.bytesReceived ?? 0,
+              frames: entry.framesDecoded ?? 0,
+              qpSum: entry.qpSum ?? 0,
+              jbDelay: entry.jitterBufferDelay ?? 0,
+              jbEmitted: entry.jitterBufferEmittedCount ?? 0,
+            };
+            const last = previous;
+            previous = now;
+            if (last == null) {
+              return;
+            }
+            const decoded = now.frames - last.frames;
+            const emitted = now.jbEmitted - last.jbEmitted;
+            console.info('Mode B video stats', {
+              // bits per millisecond is kbit/s.
+              kbps: Math.round(((now.bytes - last.bytes) * 8) / (now.at - last.at)),
+              fps: entry.framesPerSecond,
+              // Chrome only; H.264 QP above ~35 is where blocking shows.
+              avgQp: decoded > 0 && entry.qpSum != null ? +((now.qpSum - last.qpSum) / decoded).toFixed(1) : null,
+              framesDropped: entry.framesDropped,
+              freezeCount: entry.freezeCount,
+              packetsLost: entry.packetsLost,
+              nackCount: entry.nackCount,
+              pliCount: entry.pliCount,
+              keyFramesDecoded: entry.keyFramesDecoded,
+              jitterBufferMs: emitted > 0 ? Math.round(((now.jbDelay - last.jbDelay) / emitted) * 1000) : null,
+              decoderImplementation: entry.decoderImplementation,
+            });
+          });
+        })
+        .catch(() => {});
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [connected]);
+
   useEffect(() => {
     const screen = screenRef.current;
 

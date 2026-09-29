@@ -99,6 +99,8 @@ export type ModeBState = {
 
 export type ModeBSessionHandle = {
   sendInput: (message: InputMessage) => void;
+  /** WebRTC stats of the peer connection, for quality diagnostics. */
+  getStats: () => Promise<RTCStatsReport>;
   close: () => void;
 };
 
@@ -282,6 +284,7 @@ export function openModeBSession(
 
   return {
     sendInput,
+    getStats: () => pc.getStats(),
     close() {
       releaseHeldKeys();
       closed = true;

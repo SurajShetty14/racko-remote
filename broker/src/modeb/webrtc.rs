@@ -1,6 +1,6 @@
 //! Stream a decoded RDP framebuffer to a browser over WebRTC.
 //!
-//! `appsrc(RGBA) → videoconvert → nvh264enc → h264parse → rtph264pay → webrtcbin`
+//! `appsrc(RGBA) → {videoconvert|cudaupload → cudaconvert} → nvh264enc → h264parse → rtph264pay → webrtcbin`
 //!
 //! webrtcbin is the offerer and the browser answers. Signaling is JSON over a
 //! WebSocket, with the same messages as GStreamer's [webrtc sendrecv example]:
