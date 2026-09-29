@@ -65,7 +65,7 @@ ironrdp-session = { path = "../crates/ironrdp-session" }
 ironrdp-tls = { path = "../crates/ironrdp-tls", features = ["native-tls"] }
 ironrdp-tokio = { path = "../crates/ironrdp-tokio", features = ["reqwest"] }
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = "0.18"
 # Cloudflare TURN credential minting; native-tls like the RDP path (no second rustls provider).
 reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
 serde = { version = "1", features = ["derive"] }
