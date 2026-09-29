@@ -243,7 +243,7 @@ button:hover {
 
 .link-state.lost,
 .link-state.error,
-.link-state.taken-over {
+.link-state.failed {
   color: #fca5a5;
 }
 

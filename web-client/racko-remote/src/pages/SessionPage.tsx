@@ -2,9 +2,11 @@ import { useEffect, useRef, useState, type RefObject } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 
 import {
+  IronErrorKind,
   ScreenScale,
   connectSession,
   createDesktopElement,
+  errorKind,
   errorMessage,
   initRdp,
   waitUntilReady,
@@ -17,7 +19,41 @@ import { clearConnectRequest, readConnectRequest, type ConnectRequest } from '..
 /** Delays before retries 1..5 after an unexpected socket drop. */
 const RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
 
-type LinkState = 'connecting' | 'connected' | 'reconnecting' | 'lost' | 'error' | 'taken-over';
+/** A session must stay up this long before a drop earns a fresh retry budget. */
+const STABLE_SESSION_MS = 60_000;
+
+type LinkState = 'connecting' | 'connected' | 'reconnecting' | 'failed';
+
+/** A terminal state: auto-reconnect stops and the user decides whether to retry. */
+type Failure = { label: string; title: string; detail: string };
+
+const FAILURES = {
+  graphics: {
+    label: 'Error',
+    title: 'Connection error',
+    detail: 'The desktop stream could not be decoded. Reconnect when you are ready.',
+  },
+  takeover: {
+    label: 'Taken over',
+    title: 'Session taken over by another connection',
+    detail: 'Someone else signed in to this desktop. Reconnecting will disconnect them.',
+  },
+  auth: {
+    label: 'Sign-in failed',
+    title: 'Authentication failed',
+    detail: 'The desktop rejected the credentials. Check them on the connect screen.',
+  },
+  refused: {
+    label: 'Refused',
+    title: 'Connection refused',
+    detail: 'The gateway could not open this desktop: it is not on the allowed list, or the desktop refused the connection.',
+  },
+  lost: {
+    label: 'Lost',
+    title: 'Connection lost',
+    detail: `The session could not be restored after ${RETRY_DELAYS_MS.length} attempts.`,
+  },
+} satisfies Record<string, Failure>;
 
 export function SessionPage() {
   const navigate = useNavigate();
@@ -26,7 +62,7 @@ export function SessionPage() {
   const uiRef = useRef<UserInteraction | null>(null);
   const scaleRef = useRef<number>(ScreenScale.Fit);
   const [status, setStatus] = useState('Connecting…');
-  const [failed, setFailed] = useState(false);
+  const [failure, setFailure] = useState<Failure | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [barPeek, setBarPeek] = useState(false);
   const [link, setLink] = useState<LinkState>('connecting');
@@ -57,7 +93,7 @@ export function SessionPage() {
 
     void runConnection(request, abort.signal, userLeft, {
       setStatus,
-      setFailed,
+      setFailure,
       setLink,
       setRetry,
       stageRef,
@@ -167,9 +203,9 @@ export function SessionPage() {
           <span className="mark">Racko</span>
           <span className={`link-state ${link}`}>
             <span className="dot" aria-hidden="true" />
-            {linkLabel(link)}
+            {failure?.label ?? linkLabel(link)}
           </span>
-          <span className={`status${failed ? ' failed' : ''}`}>{status}</span>
+          <span className={`status${failure != null ? ' failed' : ''}`}>{status}</span>
           <div className="actions">
             <button type="button" onClick={fit}>
               Fit
@@ -198,17 +234,11 @@ export function SessionPage() {
               </div>
             </div>
           ) : null}
-          {link === 'lost' || link === 'error' || link === 'taken-over' ? (
+          {failure != null ? (
             <div className="reconnect-overlay">
               <div className="reconnect-card">
-                <h2>{overlayTitle(link)}</h2>
-                <p>
-                  {link === 'error'
-                    ? 'The desktop stream could not be decoded. Reconnect when you are ready.'
-                    : link === 'taken-over'
-                      ? 'Someone else signed in to this desktop. Reconnecting will disconnect them.'
-                      : 'The session could not be restored.'}
-                </p>
+                <h2>{failure.title}</h2>
+                <p>{failure.detail}</p>
                 <button type="button" onClick={() => setGeneration((value) => value + 1)}>
                   Reconnect
                 </button>
@@ -245,35 +275,50 @@ function isSessionTakeover(message: string): boolean {
   return /another user connected to the server|forced logoff|on the server in another session/i.test(message);
 }
 
-function showTakeover(
-  setFailed: (failed: boolean) => void,
-  setLink: (link: LinkState) => void,
-  setStatus: (status: string) => void,
-): void {
-  setFailed(true);
-  setLink('taken-over');
-  setStatus('Session taken over by another connection');
-}
-
-function overlayTitle(link: LinkState): string {
-  switch (link) {
-    case 'error':
-      return 'Connection error';
-    case 'taken-over':
-      return 'Session taken over by another connection';
-    default:
-      return 'Connection lost';
+/**
+ * Classifies a thrown connect or session error. `null` means a transport drop worth retrying.
+ * The broker answers a disallowed destination, a refused or timed-out TCP connect, and a failed
+ * X.224 or TLS handshake with an RDCleanPath error, so the `RDCleanPath` kind covers all of them.
+ * `ProxyConnect` (the gateway WebSocket failed to open) stays retryable.
+ */
+function classifyError(error: unknown): Failure | null {
+  const message = errorMessage(error);
+  if (isGraphicsFailure(message)) {
+    return FAILURES.graphics;
   }
+  if (isSessionTakeover(message)) {
+    return FAILURES.takeover;
+  }
+  switch (errorKind(error)) {
+    case IronErrorKind.WrongPassword:
+    case IronErrorKind.LogonFailure:
+    case IronErrorKind.AccessDenied:
+      return FAILURES.auth;
+    case IronErrorKind.RDCleanPath:
+    case IronErrorKind.NegotiationFailure:
+      return FAILURES.refused;
+  }
+  if (/logon failure|authentication failed|wrong password|access denied|STATUS_LOGON_FAILURE/i.test(message)) {
+    return FAILURES.auth;
+  }
+  if (/connection refused|actively refused|ECONNREFUSED|not allowed|forbidden/i.test(message)) {
+    return FAILURES.refused;
+  }
+  return null;
 }
 
-function showGraphicsError(
-  setFailed: (failed: boolean) => void,
-  setLink: (link: LinkState) => void,
-  setStatus: (status: string) => void,
-): void {
-  setFailed(true);
-  setLink('error');
-  setStatus('Connection error');
+/**
+ * Classifies a graceful end of `session.run()`. The server chose to end the session
+ * (logoff, idle limit, admin disconnect, takeover), so none of these are retried.
+ */
+function classifyDisconnect(reason: string): Failure {
+  if (isGraphicsFailure(reason)) {
+    return FAILURES.graphics;
+  }
+  if (isSessionTakeover(reason)) {
+    return FAILURES.takeover;
+  }
+  return { label: 'Ended', title: 'Session ended by the desktop', detail: reason };
 }
 
 function linkLabel(link: LinkState): string {
@@ -284,12 +329,8 @@ function linkLabel(link: LinkState): string {
       return 'Connected';
     case 'reconnecting':
       return 'Reconnecting';
-    case 'lost':
-      return 'Lost';
-    case 'error':
-      return 'Error';
-    case 'taken-over':
-      return 'Taken over';
+    case 'failed':
+      return 'Failed';
   }
 }
 
@@ -313,7 +354,7 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 
 type ConnectionHooks = {
   setStatus: (status: string) => void;
-  setFailed: (failed: boolean) => void;
+  setFailure: (failure: Failure | null) => void;
   setLink: (link: LinkState) => void;
   setRetry: (retry: number) => void;
   stageRef: RefObject<HTMLDivElement | null>;
@@ -328,74 +369,67 @@ async function runConnection(
   userLeft: RefObject<boolean>,
   hooks: ConnectionHooks,
 ): Promise<void> {
-  const { setStatus, setFailed, setLink, setRetry, stageRef, uiRef, mount, stop } = hooks;
+  const { setStatus, setFailure, setLink, setRetry, stageRef, uiRef, mount, stop } = hooks;
+  const ended = () => signal.aborted || userLeft.current;
+  const fail = (failure: Failure) => {
+    setFailure(failure);
+    setLink('failed');
+    setStatus(failure.title);
+  };
   let unexpectedEnds = 0;
 
-  while (!signal.aborted && !userLeft.current) {
+  while (!ended()) {
     const isRetry = unexpectedEnds > 0;
-    setFailed(false);
+    setFailure(null);
     setLink(isRetry ? 'reconnecting' : 'connecting');
     setRetry(unexpectedEnds);
     setStatus(isRetry ? 'Reconnecting…' : 'Connecting…');
 
+    let failure: Failure | null = null;
     try {
       const session = await openSession(request, signal, userLeft, stageRef, uiRef, mount, stop);
-      if (session == null || signal.aborted || userLeft.current) {
+      if (session == null || ended()) {
         return;
       }
-      unexpectedEnds = 0;
       setLink('connected');
       setRetry(0);
       setStatus(request.hostname);
+      const connectedAt = performance.now();
       try {
         const info = await session.run();
-        if (signal.aborted || userLeft.current) {
+        if (ended()) {
           return;
         }
-        if (isGraphicsFailure(info.reason())) {
-          showGraphicsError(setFailed, setLink, setStatus);
-          return;
-        }
-        if (isSessionTakeover(info.reason())) {
-          showTakeover(setFailed, setLink, setStatus);
-          return;
-        }
-        setStatus(info.reason());
+        failure = classifyDisconnect(info.reason());
       } catch (error) {
-        if (signal.aborted || userLeft.current) {
+        if (ended()) {
           return;
         }
-        const message = errorMessage(error);
-        if (isGraphicsFailure(message)) {
-          showGraphicsError(setFailed, setLink, setStatus);
-          return;
-        }
-        if (isSessionTakeover(message)) {
-          showTakeover(setFailed, setLink, setStatus);
-          return;
-        }
-        setStatus(message);
+        failure = classifyError(error);
+        console.warn('RDP session dropped', errorMessage(error));
+      }
+      // A connect-then-drop cycle must not reset the budget, or it loops forever.
+      if (performance.now() - connectedAt >= STABLE_SESSION_MS) {
+        unexpectedEnds = 0;
       }
     } catch (error) {
-      if (signal.aborted || userLeft.current) {
+      if (ended()) {
         return;
       }
-      const message = errorMessage(error);
-      if (isGraphicsFailure(message)) {
-        showGraphicsError(setFailed, setLink, setStatus);
-        return;
-      }
-      setStatus(message);
+      failure = classifyError(error);
+      console.warn('RDP connect failed', errorMessage(error));
     }
 
-    if (signal.aborted || userLeft.current) {
+    if (ended()) {
+      return;
+    }
+    if (failure != null) {
+      fail(failure);
       return;
     }
     unexpectedEnds += 1;
     if (unexpectedEnds > RETRY_DELAYS_MS.length) {
-      setLink('lost');
-      setFailed(true);
-      setStatus('Connection lost');
+      fail(FAILURES.lost);
       return;
     }
     setLink('reconnecting');

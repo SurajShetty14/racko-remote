@@ -70,6 +70,24 @@ export function isIronError(error: unknown): error is { backtrace: () => string 
   );
 }
 
+/** Mirrors iron-remote-desktop `IronErrorKind`. */
+export const IronErrorKind = {
+  General: 0,
+  WrongPassword: 1,
+  LogonFailure: 2,
+  AccessDenied: 3,
+  RDCleanPath: 4,
+  ProxyConnect: 5,
+  NegotiationFailure: 6,
+} as const;
+
+export function errorKind(error: unknown): number | null {
+  if (typeof error === 'object' && error !== null && typeof (error as { kind?: unknown }).kind === 'function') {
+    return (error as { kind: () => number }).kind();
+  }
+  return null;
+}
+
 export function errorMessage(error: unknown): string {
   if (isIronError(error)) {
     return error.backtrace();
