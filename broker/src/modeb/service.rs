@@ -1,17 +1,20 @@
 //! Mode B in the main broker: each WebSocket to `GET /modeb/webrtc?dest=host:port`
 //! runs its own RDP connection, encode pipeline, and WebRTC peer.
 //!
-//! `dest` must pass the same allow-list as the Mode C relay ([`Config::allows`]), and
-//! credentials come from a server-side [`CredentialResolver`], never from the browser.
+//! `dest` must pass the same allow-list as the Mode C relay ([`Config::allows`]).
+//! The browser's first message carries the RDP credentials for this session (never the URL):
+//! `{"type":"auth","username":…,"password":…,"domain":…}`. When it sends an empty username and
+//! password, the optional fallback [`CredentialResolver`] is used; otherwise the session is refused.
 //! Sessions register in the shared [`Registry`] as mode B, so the management API lists
 //! and kills them like relays.
 
 use core::net::SocketAddr;
+use core::time::Duration;
 use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow, bail};
 use axum::Router;
-use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Query, State};
 use axum::response::Response;
 use axum::routing::get;
@@ -21,12 +24,15 @@ use tracing::{Instrument as _, error, info, info_span, warn};
 
 use crate::config::{Config, broker_dotenv_path, dotenv_map, split_host_port};
 use crate::modeb::encode::EncoderSettings;
-use crate::modeb::webrtc::{init_gstreamer, send_error, stream_session};
-use crate::modeb::{CredentialResolver, ModeBConfig};
+use crate::modeb::webrtc::{AUTH_FAILED, init_gstreamer, send_error, stream_session};
+use crate::modeb::{CredentialResolver, ModeBConfig, RdpCredentials};
 use crate::registry::{Registry, SessionMode};
 
 /// Signaling route on the management HTTP server.
 pub const SIGNALING_PATH: &str = "/modeb/webrtc";
+
+/// How long the browser has to send its `auth` message after the WebSocket opens.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// GeForce NVENC allows roughly 5-8 concurrent encode sessions, depending on the driver.
 const DEFAULT_MAX_SESSIONS: usize = 5;
@@ -75,18 +81,21 @@ pub struct ModeBService {
     config: Arc<Config>,
     settings: ModeBServiceConfig,
     registry: Arc<Registry>,
-    credentials: Arc<dyn CredentialResolver>,
+    fallback_credentials: Option<Arc<dyn CredentialResolver>>,
     slots: Arc<Semaphore>,
 }
 
 impl ModeBService {
     /// Fails when GStreamer or its WebRTC plugins are missing, so the caller can keep
     /// serving Mode C without Mode B.
+    ///
+    /// `fallback_credentials` signs in for browsers that send no credentials; with `None`,
+    /// every session needs browser credentials.
     pub fn new(
         config: Arc<Config>,
         settings: ModeBServiceConfig,
         registry: Arc<Registry>,
-        credentials: Arc<dyn CredentialResolver>,
+        fallback_credentials: Option<Arc<dyn CredentialResolver>>,
     ) -> anyhow::Result<Self> {
         init_gstreamer()?;
         let slots = Arc::new(Semaphore::new(settings.max_sessions));
@@ -94,7 +103,7 @@ impl ModeBService {
             config,
             settings,
             registry,
-            credentials,
+            fallback_credentials,
             slots,
         })
     }
@@ -138,6 +147,73 @@ impl ModeBService {
             return;
         }
 
+        // Before taking a GPU slot, so a browser without credentials never holds one.
+        let resolved: anyhow::Result<(RdpCredentials, &'static str)> = async {
+            let hello = tokio::time::timeout(AUTH_TIMEOUT, async {
+                loop {
+                    let msg = socket
+                        .recv()
+                        .await
+                        .context("browser closed the socket before sending credentials")?
+                        .context("signaling WebSocket receive")?;
+                    match msg {
+                        // The parse error is dropped: it can quote field values.
+                        Message::Text(text) => {
+                            break serde_json::from_str::<ClientHello>(text.as_str())
+                                .map_err(|_| anyhow!("first message is not an auth message"));
+                        }
+                        Message::Close(_) => bail!("browser closed the socket before sending credentials"),
+                        Message::Binary(_) | Message::Ping(_) | Message::Pong(_) => {}
+                    }
+                }
+            })
+            .await
+            .map_err(|_| anyhow!("no auth message within {}s", AUTH_TIMEOUT.as_secs()))??;
+
+            let ClientHello::Auth {
+                username,
+                password,
+                domain,
+            } = hello;
+            let username = username.trim().to_owned();
+            match (username.is_empty(), password.is_empty()) {
+                (false, false) => {
+                    let domain = domain
+                        .map(|domain| domain.trim().to_owned())
+                        .filter(|domain| !domain.is_empty());
+                    Ok((
+                        RdpCredentials {
+                            username,
+                            password,
+                            domain,
+                        },
+                        "browser",
+                    ))
+                }
+                (true, true) => {
+                    let fallback = self
+                        .fallback_credentials
+                        .as_ref()
+                        .context("browser sent no credentials and no fallback is configured")?;
+                    let credentials = fallback
+                        .resolve(&host, port)
+                        .await
+                        .context("fallback credential lookup")?;
+                    Ok((credentials, "fallback"))
+                }
+                _ => bail!("browser sent a username or a password, but not both"),
+            }
+        }
+        .await;
+        let (credentials, source) = match resolved {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                warn!(%client_ip, %dest, reason = format!("{err:#}"), "Rejected Mode B session: authentication failed");
+                send_error(&mut socket, AUTH_FAILED).await;
+                return;
+            }
+        };
+
         let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
             error!(
                 %client_ip,
@@ -149,15 +225,7 @@ impl ModeBService {
             return;
         };
 
-        let credentials = match self.credentials.resolve(&host, port).await {
-            Ok(credentials) => credentials,
-            Err(err) => {
-                error!(%client_ip, %dest, error = format!("{err:#}"), "Mode B credential lookup failed");
-                send_error(&mut socket, "No credentials are configured for this destination").await;
-                return;
-            }
-        };
-
+        let username = credentials.username.clone();
         let label = format!("{host}:{port}");
         let rdp = ModeBConfig::for_target(
             host,
@@ -170,7 +238,16 @@ impl ModeBService {
         let live = self.registry.register(SessionMode::B, label.clone(), client_ip.clone());
         let session_id = live.session.id;
         let span = info_span!("modeb", %session_id, dest = %label);
-        span.in_scope(|| info!(%client_ip, active = self.active_sessions(), max_sessions, "Mode B session starting"));
+        span.in_scope(|| {
+            info!(
+                %client_ip,
+                %username,
+                credentials = source,
+                active = self.active_sessions(),
+                max_sessions,
+                "Mode B session starting"
+            );
+        });
 
         // Each session gets its own thread and current-thread runtime: the IronRDP connect and
         // framed futures are not `Send`, and a panic in one session cannot reach the others.
@@ -217,6 +294,20 @@ impl ModeBService {
         drop(live);
         drop(permit);
     }
+}
+
+/// First browser message on the signaling socket. No `Debug`: it carries the password.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum ClientHello {
+    Auth {
+        #[serde(default)]
+        username: String,
+        #[serde(default)]
+        password: String,
+        #[serde(default)]
+        domain: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]

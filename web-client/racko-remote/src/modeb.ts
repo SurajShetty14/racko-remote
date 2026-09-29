@@ -15,10 +15,33 @@ function defaultSignalingUrl(): string {
   return url.toString();
 }
 
-/** Router state handed from the connect page to the Mode B session page. */
+/**
+ * Handed from the connect page to the Mode B session page. Kept in memory rather than router
+ * state, which the browser persists in session history.
+ */
 export type ModeBRequest = {
   hostname: string;
+  username: string;
+  password: string;
+  domain: string;
 };
+
+let pendingRequest: ModeBRequest | null = null;
+
+export function saveModeBRequest(request: ModeBRequest): void {
+  pendingRequest = request;
+}
+
+export function readModeBRequest(): ModeBRequest | null {
+  return pendingRequest;
+}
+
+export function clearModeBRequest(): void {
+  pendingRequest = null;
+}
+
+/** Prefix of the broker's error for missing, malformed, or rejected credentials. */
+export const AUTH_FAILED = 'Authentication failed';
 
 type MouseButtonName = 'left' | 'middle' | 'right';
 
@@ -31,6 +54,7 @@ export type InputMessage =
   | { type: 'keyup'; code: string };
 
 type SignalingMessage =
+  | { type: 'auth'; username: string; password: string; domain: string }
   | { type: 'offer' | 'answer'; sdp: string }
   | { type: 'ice'; candidate: string; sdpMLineIndex: number | null }
   | { type: 'error'; message: string };
@@ -61,13 +85,14 @@ export const INITIAL_MODEB_STATE: ModeBState = {
 const BUTTONS: readonly MouseButtonName[] = ['left', 'middle', 'right'];
 
 /**
- * Opens a Mode B WebRTC session to `dest` (host:port): signaling WebSocket, receive-only H.264
- * video into `video`, and the pre-negotiated "input" data channel fed by mouse and keyboard
- * events on `video`. The broker signs in with its own credentials.
+ * Opens a Mode B WebRTC session to `request.hostname` (host:port): signaling WebSocket,
+ * receive-only H.264 video into `video`, and the pre-negotiated "input" data channel fed by mouse
+ * and keyboard events on `video`. The credentials go in the first signaling message, never the URL;
+ * the broker signs in to the desktop with them.
  */
 export function openModeBSession(
   video: HTMLVideoElement,
-  dest: string,
+  request: ModeBRequest,
   onState: (state: ModeBState) => void,
 ): ModeBSessionHandle {
   let state = INITIAL_MODEB_STATE;
@@ -81,7 +106,7 @@ export function openModeBSession(
   };
 
   const signalingUrl = new URL(MODEB_SIGNALING_URL);
-  signalingUrl.searchParams.set('dest', dest);
+  signalingUrl.searchParams.set('dest', request.hostname);
   const ws = new WebSocket(signalingUrl);
   const send = (message: SignalingMessage) => {
     if (ws.readyState === WebSocket.OPEN) {
@@ -124,7 +149,10 @@ export function openModeBSession(
     video.play().catch((error: unknown) => console.warn('Mode B video.play() failed', error));
   };
 
-  ws.onopen = () => update({ signaling: 'open' });
+  ws.onopen = () => {
+    send({ type: 'auth', username: request.username, password: request.password, domain: request.domain });
+    update({ signaling: 'open' });
+  };
   ws.onclose = () => update({ signaling: 'closed' });
   ws.onerror = () => {
     if (state.signaling === 'connecting') {

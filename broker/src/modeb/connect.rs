@@ -27,7 +27,7 @@ impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
 pub(super) type UpgradedFramed = TokioFramed<Box<dyn AsyncReadWrite + Unpin + Send + Sync>>;
 
-/// Bastion-side RDP target and credentials (never sent to the browser client).
+/// RDP target and the credentials the broker signs in with (never echoed back to the browser).
 #[derive(Clone)]
 pub struct ModeBConfig {
     pub host: String,
@@ -229,6 +229,30 @@ pub(super) async fn connect(config: &ModeBConfig) -> anyhow::Result<(ConnectionR
     .context("connect finalize")?;
 
     Ok((connection_result, upgraded_framed))
+}
+
+/// Whether [`connect`] failed because the target rejected the credentials during CredSSP (NLA),
+/// rather than a network, TLS, or protocol failure.
+#[cfg(feature = "modeb-encode")]
+pub(super) fn is_auth_failure(err: &anyhow::Error) -> bool {
+    use ironrdp_connector::{ConnectorError, ConnectorErrorKind, sspi};
+
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<ConnectorError>()
+            .is_some_and(|error| match error.kind() {
+                ConnectorErrorKind::AccessDenied => true,
+                // The server's TSRequest errorCode (STATUS_LOGON_FAILURE, STATUS_WRONG_PASSWORD, ...).
+                ConnectorErrorKind::Credssp(error) => {
+                    error.nstatus.is_some()
+                        || matches!(
+                            error.error_type,
+                            sspi::ErrorKind::LogonDenied | sspi::ErrorKind::NoCredentials
+                        )
+                }
+                _ => false,
+            })
+    })
 }
 
 fn build_connector_config(config: &ModeBConfig) -> anyhow::Result<ironrdp_connector::Config> {

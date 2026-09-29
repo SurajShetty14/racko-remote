@@ -5,7 +5,10 @@
 //! webrtcbin is the offerer and the browser answers. Signaling is JSON over a
 //! WebSocket, with the same messages as GStreamer's [webrtc sendrecv example]:
 //! `{"type":"offer"|"answer","sdp":…}` and `{"type":"ice","candidate":…,"sdpMLineIndex":…}`.
-//! The broker also sends `{"type":"error","message":…}` before closing when a session cannot start.
+//! On the broker's `/modeb/webrtc` route the browser first sends
+//! `{"type":"auth","username":…,"password":…,"domain":…}` (see [`super::service`]).
+//! The broker also sends `{"type":"error","message":…}` before closing when a session cannot start;
+//! credential failures start with [`AUTH_FAILED`].
 //! No STUN/TURN is configured, so only host candidates are gathered and the
 //! browser must reach the box directly.
 //!
@@ -61,6 +64,9 @@ const DEFAULT_BIND: &str = "127.0.0.1:8080";
 
 /// TCP + TLS + CredSSP + capability exchange with the target VM.
 const RDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Browser-facing error for missing, malformed, or rejected credentials.
+pub(super) const AUTH_FAILED: &str = "Authentication failed";
 
 /// Linked after the encoder. The RTP capsfilter lets webrtcbin build the offer
 /// before the first encoded buffer reaches it.
@@ -242,7 +248,12 @@ pub(super) async fn stream_session(
     let (connection_result, framed) = match connected {
         Ok(connected) => connected,
         Err(err) => {
-            send_error(&mut socket, "Could not connect to the remote desktop").await;
+            let message = if connect::is_auth_failure(&err) {
+                AUTH_FAILED
+            } else {
+                "Could not connect to the remote desktop"
+            };
+            send_error(&mut socket, message).await;
             return Err(err.context("Mode B connect"));
         }
     };

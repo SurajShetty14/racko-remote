@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
-import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 
 import {
+  AUTH_FAILED,
   INITIAL_MODEB_STATE,
+  clearModeBRequest,
   openModeBSession,
+  readModeBRequest,
   type InputMessage,
-  type ModeBRequest,
   type ModeBSessionHandle,
   type ModeBState,
 } from '../modeb';
@@ -23,8 +25,8 @@ const CTRL_ALT_DEL: readonly InputMessage[] = [
 
 export function ModeBSession() {
   const navigate = useNavigate();
-  const location = useLocation();
-  const hostname = (location.state as ModeBRequest | null)?.hostname ?? null;
+  const [request] = useState(readModeBRequest);
+  const hostname = request?.hostname ?? null;
   const screenRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const sessionRef = useRef<ModeBSessionHandle | null>(null);
@@ -35,7 +37,7 @@ export function ModeBSession() {
 
   useEffect(() => {
     const video = videoRef.current;
-    if (hostname == null || video == null) {
+    if (request == null || video == null) {
       return;
     }
     setState(INITIAL_MODEB_STATE);
@@ -43,7 +45,7 @@ export function ModeBSession() {
     // StrictMode mounts effects twice in dev, and the signaling server serves a single socket per
     // session, so only open it once the mount has settled.
     const timer = window.setTimeout(() => {
-      session = openModeBSession(video, hostname, setState);
+      session = openModeBSession(video, request, setState);
       sessionRef.current = session;
     }, 0);
     return () => {
@@ -51,7 +53,7 @@ export function ModeBSession() {
       session?.close();
       sessionRef.current = null;
     };
-  }, [hostname]);
+  }, [request]);
 
   useEffect(() => {
     const screen = screenRef.current;
@@ -99,6 +101,7 @@ export function ModeBSession() {
     }
     sessionRef.current?.close();
     sessionRef.current = null;
+    clearModeBRequest();
     navigate('/');
   }
 
@@ -169,9 +172,13 @@ export function ModeBSession() {
           {link === 'lost' || link === 'error' ? (
             <div className="reconnect-overlay">
               <div className="reconnect-card">
-                <h2>{link === 'error' ? 'Connection error' : 'Stream ended'}</h2>
-                <p>{state.error ?? 'The GPU stream closed.'}</p>
-                <Link to="/" className="back-link">
+                <h2>{overlayTitle(link, state)}</h2>
+                <p>
+                  {state.error?.startsWith(AUTH_FAILED)
+                    ? 'The desktop rejected the credentials. Check them on the connect screen.'
+                    : (state.error ?? 'The GPU stream closed.')}
+                </p>
+                <Link to="/" className="back-link" onClick={clearModeBRequest}>
                   Back to connect
                 </Link>
               </div>
@@ -191,6 +198,13 @@ function linkState(state: ModeBState): LinkState {
     return 'lost';
   }
   return state.peer === 'connected' ? 'connected' : 'connecting';
+}
+
+function overlayTitle(link: LinkState, state: ModeBState): string {
+  if (state.error?.startsWith(AUTH_FAILED)) {
+    return AUTH_FAILED;
+  }
+  return link === 'error' ? 'Connection error' : 'Stream ended';
 }
 
 function linkLabel(link: LinkState): string {

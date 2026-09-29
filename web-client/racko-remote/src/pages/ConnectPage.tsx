@@ -1,7 +1,7 @@
 import { type FormEvent, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 
-import type { ModeBRequest } from '../modeb';
+import { saveModeBRequest } from '../modeb';
 import { DESKTOP_PRESETS } from '../rdp';
 import { saveConnectRequest } from '../session-store';
 
@@ -26,12 +26,13 @@ export function ConnectPage() {
       setError('Hostname must be host:port, for example rdp.example.com:3389.');
       return;
     }
-    if (mode === 'mode-b') {
-      navigate('/modeb', { state: { hostname: host } satisfies ModeBRequest });
-      return;
-    }
     if (user === '' || password === '') {
       setError('Username and password are required.');
+      return;
+    }
+    if (mode === 'mode-b') {
+      saveModeBRequest({ hostname: host, username: user, password, domain: domain.trim() });
+      navigate('/modeb');
       return;
     }
     const preset = DESKTOP_PRESETS.find((size) => `${size.width}x${size.height}` === desktop);
@@ -80,48 +81,47 @@ export function ConnectPage() {
             spellCheck={false}
           />
         </label>
+        <label>
+          Username
+          <input
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+            autoComplete="username"
+          />
+        </label>
+        <label>
+          Password
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            autoComplete="current-password"
+          />
+        </label>
         {mode === 'mode-c' ? (
-          <>
-            <label>
-              Username
-              <input
-                value={username}
-                onChange={(event) => setUsername(event.target.value)}
-                autoComplete="username"
-              />
-            </label>
-            <label>
-              Password
-              <input
-                type="password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                autoComplete="current-password"
-              />
-            </label>
-            <label>
-              Resolution
-              <select value={desktop} onChange={(event) => setDesktop(event.target.value)}>
-                {DESKTOP_PRESETS.map((size) => (
-                  <option key={`${size.width}x${size.height}`} value={`${size.width}x${size.height}`}>
-                    {size.width}×{size.height}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Domain
-              <span className="optional">optional</span>
-              <input
-                value={domain}
-                onChange={(event) => setDomain(event.target.value)}
-                autoComplete="off"
-              />
-            </label>
-          </>
-        ) : (
-          <p className="lede">The broker signs in and picks the desktop size; no credentials leave this page.</p>
-        )}
+          <label>
+            Resolution
+            <select value={desktop} onChange={(event) => setDesktop(event.target.value)}>
+              {DESKTOP_PRESETS.map((size) => (
+                <option key={`${size.width}x${size.height}`} value={`${size.width}x${size.height}`}>
+                  {size.width}×{size.height}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+        <label>
+          Domain
+          <span className="optional">optional</span>
+          <input
+            value={domain}
+            onChange={(event) => setDomain(event.target.value)}
+            autoComplete="off"
+          />
+        </label>
+        {mode === 'mode-b' ? (
+          <p className="lede">The broker signs in with these credentials and picks the desktop size.</p>
+        ) : null}
 
         {error !== '' ? <p className="form-error">{error}</p> : null}
 

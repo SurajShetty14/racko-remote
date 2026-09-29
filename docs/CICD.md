@@ -63,8 +63,6 @@ sudo tee /opt/racko/broker.env >/dev/null <<'EOF'
 BIND_ADDR=0.0.0.0:7171
 MANAGEMENT_ADDR=127.0.0.1:9091
 RDP_TARGET=203.0.113.10:3389
-RDP_USERNAME=Administrator
-RDP_PASSWORD=change-me
 RDP_TLS_VERIFY=insecure
 IDLE_TIMEOUT_SECS=900
 EOF
@@ -72,10 +70,11 @@ sudo chown gisuladmin:gisuladmin /opt/racko/broker.env
 sudo chmod 600 /opt/racko/broker.env
 ```
 
-Edit `RDP_TARGET` and credentials for the lab VM.
+Edit `RDP_TARGET` for the lab VM.
 `MANAGEMENT_ADDR` must stay on `127.0.0.1:9091` so deploy health checks can reach `/healthz`.
 Optional: `RDP_ALLOWED_TARGETS` (comma-separated `host:port`) allows more VMs for both modes, and `MODEB_MAX_SESSIONS` (default 5) caps concurrent Mode B sessions below the GPU's NVENC limit.
-Mode B signs in to every allowed VM with `RDP_USERNAME` / `RDP_PASSWORD`.
+Mode B signs in with the credentials each user enters on the connect page.
+Setting `RDP_USERNAME` / `RDP_PASSWORD` adds a fallback for users who leave both fields blank, which gives them that account's desktop without signing in; leave them unset in production.
 
 ### systemd unit
 

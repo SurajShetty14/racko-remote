@@ -64,11 +64,13 @@ async fn main() -> anyhow::Result<()> {
 /// Mode B signaling routes, or none when Mode B cannot start (Mode C keeps running).
 #[cfg(feature = "modeb-encode")]
 fn modeb_routes(config: &Arc<Config>, registry: &Arc<Registry>) -> axum::Router {
-    use broker::modeb::{EnvCredentials, ModeBService, ModeBServiceConfig, SIGNALING_PATH};
+    use broker::modeb::{CredentialResolver, EnvCredentials, ModeBService, ModeBServiceConfig, SIGNALING_PATH};
 
+    let fallback = EnvCredentials::load();
+    let fallback_enabled = fallback.is_some();
     let service = ModeBServiceConfig::load().and_then(|settings| {
-        let credentials = Arc::new(EnvCredentials::load()?);
-        ModeBService::new(Arc::clone(config), settings, Arc::clone(registry), credentials)
+        let fallback = fallback.map(|credentials| Arc::new(credentials) as Arc<dyn CredentialResolver>);
+        ModeBService::new(Arc::clone(config), settings, Arc::clone(registry), fallback)
     });
     match service {
         Ok(service) => {
@@ -76,8 +78,15 @@ fn modeb_routes(config: &Arc<Config>, registry: &Arc<Registry>) -> axum::Router 
                 path = SIGNALING_PATH,
                 max_sessions = service.settings().max_sessions,
                 encoder = ?service.settings().encoder,
+                fallback_credentials = fallback_enabled,
                 "Mode B WebRTC signaling enabled"
             );
+            if fallback_enabled {
+                tracing::warn!(
+                    "Mode B signs in with RDP_USERNAME/RDP_PASSWORD when a browser sends no credentials; \
+                     unset them to require per-session credentials"
+                );
+            }
             Arc::new(service).router()
         }
         Err(err) => {
