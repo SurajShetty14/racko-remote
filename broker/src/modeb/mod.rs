@@ -20,7 +20,7 @@ mod service;
 #[cfg(feature = "modeb-encode")]
 mod webrtc;
 
-pub use connect::{ModeBConfig, run};
+pub use connect::{ModeBConfig, fit_desktop_size, run};
 pub use credentials::{CredentialResolver, EnvCredentials, RdpCredentials};
 pub use framebuffer::FRAME_PNG_PATH;
 pub use ice::{IceServer, IceServers, TurnMinter};

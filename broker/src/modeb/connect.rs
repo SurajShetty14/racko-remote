@@ -140,6 +140,32 @@ impl core::fmt::Debug for ModeBConfig {
     }
 }
 
+/// Fit a browser-requested desktop size inside 1920 × 1200 (bounding NVENC load and bitrate),
+/// keeping its aspect ratio, then round each side down to an even number.
+///
+/// Even sides are required by the H.264 4:2:0 encode; 200 is the smallest desktop side
+/// servers accept ([MS-RDPBCGR 2.2.1.3.2]).
+///
+/// [MS-RDPBCGR 2.2.1.3.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/00f1da4a-ee9c-421a-852f-c19f92343d73
+pub fn fit_desktop_size(width: u32, height: u32) -> (u16, u16) {
+    const MIN_SIDE: u64 = 200;
+    let max_width: u64 = 1920;
+    let max_height: u64 = 1200;
+
+    let (mut width, mut height) = (u64::from(width.max(1)), u64::from(height.max(1)));
+    if max_width < width {
+        height = height * max_width / width;
+        width = max_width;
+    }
+    if max_height < height {
+        width = width * max_height / height;
+        height = max_height;
+    }
+
+    let side = |value: u64, max: u64| u16::try_from(value.clamp(MIN_SIDE, max) & !1).unwrap_or(u16::MAX);
+    (side(width, max_width), side(height, max_height))
+}
+
 fn lookup(file: &std::collections::HashMap<String, String>, key: &str) -> Option<String> {
     std::env::var(key).ok().or_else(|| file.get(key).cloned())
 }
@@ -549,4 +575,36 @@ fn write_frame(image: &DecodedImage, config: &ModeBConfig, update_count: u64, du
         "Wrote framebuffer PNG"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_desktop_size;
+
+    #[test]
+    fn keeps_sizes_that_fit() {
+        assert_eq!(fit_desktop_size(1920, 1080), (1920, 1080));
+        assert_eq!(fit_desktop_size(1366, 768), (1366, 768));
+        assert_eq!(fit_desktop_size(1920, 1200), (1920, 1200));
+    }
+
+    #[test]
+    fn scales_down_keeping_aspect_ratio() {
+        assert_eq!(fit_desktop_size(2560, 1440), (1920, 1080));
+        assert_eq!(fit_desktop_size(3840, 2160), (1920, 1080));
+        assert_eq!(fit_desktop_size(2560, 1600), (1920, 1200));
+        assert_eq!(fit_desktop_size(3440, 1440), (1920, 802));
+        assert_eq!(fit_desktop_size(2000, 1500), (1600, 1200));
+    }
+
+    #[test]
+    fn rounds_down_to_even() {
+        assert_eq!(fit_desktop_size(1535, 863), (1534, 862));
+    }
+
+    #[test]
+    fn clamps_to_minimum() {
+        assert_eq!(fit_desktop_size(0, 0), (200, 200));
+        assert_eq!(fit_desktop_size(100, 150), (200, 200));
+    }
 }

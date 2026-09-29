@@ -269,6 +269,8 @@ pub(super) async fn stream_session(
             return Err(err.context("Mode B connect"));
         }
     };
+    // The encoder, framebuffer and input scaling all follow the negotiated size, which the
+    // server may change from the requested one.
     let width = connection_result.desktop_size.width;
     let height = connection_result.desktop_size.height;
     info!(
@@ -278,6 +280,13 @@ pub(super) async fn stream_session(
         compression = ?connection_result.compression_type,
         "Negotiated session parameters"
     );
+    if (width, height) != (rdp.desktop_width, rdp.desktop_height) {
+        warn!(
+            requested = format!("{}x{}", rdp.desktop_width, rdp.desktop_height),
+            negotiated = format!("{width}x{height}"),
+            "Server changed the requested desktop size"
+        );
+    }
 
     let parts = match build_stream(width, height, settings, ice, counters.as_ref()) {
         Ok(parts) => parts,

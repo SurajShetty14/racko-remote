@@ -1,7 +1,7 @@
 import { type FormEvent, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 
-import { saveModeBRequest } from '../modeb';
+import { modeBDesktopSize, saveModeBRequest } from '../modeb';
 import { DESKTOP_PRESETS } from '../rdp';
 import { saveConnectRequest } from '../session-store';
 
@@ -31,7 +31,7 @@ export function ConnectPage() {
       return;
     }
     if (mode === 'mode-b') {
-      saveModeBRequest({ hostname: host, username: user, password, domain: domain.trim() });
+      saveModeBRequest({ hostname: host, username: user, password, domain: domain.trim(), ...modeBDesktopSize() });
       navigate('/modeb');
       return;
     }
@@ -120,7 +120,7 @@ export function ConnectPage() {
           />
         </label>
         {mode === 'mode-b' ? (
-          <p className="lede">The broker signs in with these credentials and picks the desktop size.</p>
+          <p className="lede">The broker signs in with these credentials; the desktop matches your screen (up to 1920×1200).</p>
         ) : null}
 
         {error !== '' ? <p className="form-error">{error}</p> : null}

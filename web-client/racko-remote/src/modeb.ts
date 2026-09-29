@@ -24,7 +24,33 @@ export type ModeBRequest = {
   username: string;
   password: string;
   domain: string;
+  /** Requested RDP desktop size in device pixels, from {@link modeBDesktopSize}. */
+  width: number;
+  height: number;
 };
+
+const MAX_DESKTOP_WIDTH = 1920;
+const MAX_DESKTOP_HEIGHT = 1200;
+
+/**
+ * This screen's size in device pixels, scaled down to fit 1920×1200 with its aspect ratio kept
+ * (clamping each side alone would reintroduce letterboxing), and rounded down to even numbers
+ * for the H.264 encoder. The broker applies the same limits.
+ */
+export function modeBDesktopSize(): { width: number; height: number } {
+  const dpr = window.devicePixelRatio || 1;
+  let width = Math.max(1, Math.floor(window.screen.width * dpr));
+  let height = Math.max(1, Math.floor(window.screen.height * dpr));
+  if (width > MAX_DESKTOP_WIDTH) {
+    height = Math.floor((height * MAX_DESKTOP_WIDTH) / width);
+    width = MAX_DESKTOP_WIDTH;
+  }
+  if (height > MAX_DESKTOP_HEIGHT) {
+    width = Math.floor((width * MAX_DESKTOP_HEIGHT) / height);
+    height = MAX_DESKTOP_HEIGHT;
+  }
+  return { width: width & ~1, height: height & ~1 };
+}
 
 let pendingRequest: ModeBRequest | null = null;
 
@@ -54,7 +80,7 @@ export type InputMessage =
   | { type: 'keyup'; code: string };
 
 type SignalingMessage =
-  | { type: 'auth'; username: string; password: string; domain: string }
+  | { type: 'auth'; username: string; password: string; domain: string; width: number; height: number }
   | { type: 'offer' | 'answer'; sdp: string }
   | { type: 'ice'; candidate: string; sdpMLineIndex: number | null }
   | { type: 'ice-servers'; iceServers: RTCIceServer[] }
@@ -160,7 +186,14 @@ export function openModeBSession(
   };
 
   ws.onopen = () => {
-    send({ type: 'auth', username: request.username, password: request.password, domain: request.domain });
+    send({
+      type: 'auth',
+      username: request.username,
+      password: request.password,
+      domain: request.domain,
+      width: request.width,
+      height: request.height,
+    });
     update({ signaling: 'open' });
   };
   ws.onclose = () => update({ signaling: 'closed' });

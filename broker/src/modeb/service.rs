@@ -3,7 +3,9 @@
 //!
 //! `dest` must pass the same allow-list as the Mode C relay ([`Config::allows`]).
 //! The browser's first message carries the RDP credentials for this session (never the URL):
-//! `{"type":"auth","username":…,"password":…,"domain":…}`. When it sends an empty username and
+//! `{"type":"auth","username":…,"password":…,"domain":…,"width":…,"height":…}`. The optional
+//! `width`/`height` set the RDP desktop size (see [`fit_desktop_size`]); without them the
+//! `MODEB_DESKTOP_WIDTH`/`HEIGHT` default applies. When it sends an empty username and
 //! password, the optional fallback [`CredentialResolver`] is used; otherwise the session is refused.
 //! Each accepted session then mints its own Cloudflare TURN credentials ([`TurnMinter`]).
 //! Sessions register in the shared [`Registry`] as mode B, so the management API lists
@@ -26,7 +28,7 @@ use tracing::{Instrument as _, error, info, info_span, warn};
 use crate::config::{Config, broker_dotenv_path, dotenv_map, split_host_port};
 use crate::modeb::encode::EncoderSettings;
 use crate::modeb::webrtc::{AUTH_FAILED, init_gstreamer, send_error, stream_session};
-use crate::modeb::{CredentialResolver, ModeBConfig, RdpCredentials, TurnMinter};
+use crate::modeb::{CredentialResolver, ModeBConfig, RdpCredentials, TurnMinter, fit_desktop_size};
 use crate::registry::{Registry, SessionMode};
 
 /// Signaling route on the management HTTP server.
@@ -37,15 +39,16 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// GeForce NVENC allows roughly 5-8 concurrent encode sessions, depending on the driver.
 const DEFAULT_MAX_SESSIONS: usize = 5;
-const DEFAULT_DESKTOP_WIDTH: u16 = 1280;
-const DEFAULT_DESKTOP_HEIGHT: u16 = 1024;
+const DEFAULT_DESKTOP_WIDTH: u16 = 1920;
+const DEFAULT_DESKTOP_HEIGHT: u16 = 1080;
 
 /// Broker-hosted Mode B settings.
 #[derive(Debug, Clone)]
 pub struct ModeBServiceConfig {
     /// `MODEB_MAX_SESSIONS`: sessions beyond this are rejected before touching the GPU.
     pub max_sessions: usize,
-    /// `MODEB_DESKTOP_WIDTH` / `MODEB_DESKTOP_HEIGHT`: requested RDP desktop size.
+    /// `MODEB_DESKTOP_WIDTH` / `MODEB_DESKTOP_HEIGHT`: RDP desktop size when the browser
+    /// requests none in its `auth` message.
     pub desktop_width: u16,
     pub desktop_height: u16,
     pub encoder: EncoderSettings,
@@ -152,6 +155,7 @@ impl ModeBService {
         }
 
         // Before taking a GPU slot, so a browser without credentials never holds one.
+        let mut requested_size = None;
         let resolved: anyhow::Result<(RdpCredentials, &'static str)> = async {
             let hello = tokio::time::timeout(AUTH_TIMEOUT, async {
                 loop {
@@ -178,7 +182,10 @@ impl ModeBService {
                 username,
                 password,
                 domain,
+                width,
+                height,
             } = hello;
+            requested_size = width.zip(height);
             let username = username.trim().to_owned();
             match (username.is_empty(), password.is_empty()) {
                 (false, false) => {
@@ -238,6 +245,11 @@ impl ModeBService {
             }
         };
 
+        let (width, height) = requested_size.unwrap_or((
+            u32::from(self.settings.desktop_width),
+            u32::from(self.settings.desktop_height),
+        ));
+        let (desktop_width, desktop_height) = fit_desktop_size(width, height);
         let username = credentials.username.clone();
         let label = format!("{host}:{port}");
         let rdp = ModeBConfig::for_target(
@@ -245,8 +257,8 @@ impl ModeBService {
             port,
             credentials,
             self.config.tls_insecure,
-            self.settings.desktop_width,
-            self.settings.desktop_height,
+            desktop_width,
+            desktop_height,
         );
         let live = self.registry.register(SessionMode::B, label.clone(), client_ip.clone());
         let session_id = live.session.id;
@@ -256,6 +268,8 @@ impl ModeBService {
                 %client_ip,
                 %username,
                 credentials = source,
+                desktop = format!("{desktop_width}x{desktop_height}"),
+                requested_size = ?requested_size,
                 turn_servers = ice.turn_count(),
                 active = self.active_sessions(),
                 max_sessions,
@@ -321,6 +335,11 @@ enum ClientHello {
         password: String,
         #[serde(default)]
         domain: Option<String>,
+        /// Requested desktop size in device pixels; fitted by [`fit_desktop_size`].
+        #[serde(default)]
+        width: Option<u32>,
+        #[serde(default)]
+        height: Option<u32>,
     },
 }
 
