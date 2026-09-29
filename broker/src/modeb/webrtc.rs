@@ -9,8 +9,12 @@
 //! `{"type":"auth","username":…,"password":…,"domain":…}` (see [`super::service`]).
 //! The broker also sends `{"type":"error","message":…}` before closing when a session cannot start;
 //! credential failures start with [`AUTH_FAILED`].
-//! No STUN/TURN is configured, so only host candidates are gathered and the
-//! browser must reach the box directly.
+//!
+//! Each broker session gets freshly minted STUN/TURN servers ([`IceServers`], see [`super::ice`]).
+//! webrtcbin uses them, and the broker sends them to the browser before the offer as
+//! `{"type":"ice-servers","iceServers":[RTCIceServer…]}`, so both peers can relay through TURN.
+//! With no servers (the deprecated probe), only host candidates are gathered and the browser must
+//! reach the box directly.
 //!
 //! An ordered `input` data channel (pre-negotiated, id 0) carries browser
 //! mouse/keyboard JSON back to the RDP session (see [`super::input`]).
@@ -48,10 +52,10 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{Instrument as _, Span, debug, info, warn};
 
 use crate::config::{broker_dotenv_path, dotenv_map};
-use crate::modeb::ModeBConfig;
 use crate::modeb::connect;
 use crate::modeb::encode::{EncoderSettings, H264Pipeline};
 use crate::modeb::input::InputTranslator;
+use crate::modeb::{IceServer, IceServers, ModeBConfig};
 use crate::registry::Session;
 
 /// Label and pre-negotiated SCTP stream id of the browser input channel (must match the web client).
@@ -134,6 +138,12 @@ enum SignalMsg {
     Error {
         message: String,
     },
+    /// Broker to browser only, before the offer: this session's minted STUN/TURN servers.
+    #[serde(rename = "ice-servers")]
+    IceServers {
+        #[serde(rename = "iceServers")]
+        ice_servers: Vec<IceServer>,
+    },
 }
 
 /// Posted from GStreamer threads to the signaling task.
@@ -202,7 +212,8 @@ pub async fn run_webrtc(rdp: ModeBConfig, webrtc: WebRtcConfig) -> anyhow::Resul
         .context("test page server stopped before a browser connected")?;
     info!("Browser opened signaling WebSocket; connecting to RDP target");
 
-    let result = stream_session(socket, &rdp, &webrtc.encoder, None).await;
+    // Host candidates only: the probe serves a browser on this box.
+    let result = stream_session(socket, &rdp, &webrtc.encoder, &IceServers::default(), None).await;
     server.abort();
     result
 }
@@ -239,6 +250,7 @@ pub(super) async fn stream_session(
     mut socket: WebSocket,
     rdp: &ModeBConfig,
     settings: &EncoderSettings,
+    ice: &IceServers,
     counters: Option<Arc<Session>>,
 ) -> anyhow::Result<()> {
     let connected = match tokio::time::timeout(RDP_CONNECT_TIMEOUT, connect::connect(rdp)).await {
@@ -267,7 +279,7 @@ pub(super) async fn stream_session(
         "Negotiated session parameters"
     );
 
-    let parts = match build_stream(width, height, settings, counters.as_ref()) {
+    let parts = match build_stream(width, height, settings, ice, counters.as_ref()) {
         Ok(parts) => parts,
         Err(err) => {
             send_error(&mut socket, "Could not start the video stream").await;
@@ -281,6 +293,18 @@ pub(super) async fn stream_session(
         input_rx,
         events_rx,
     } = parts;
+
+    // Queued offers and candidates only leave through the signaling loop, so this arrives first.
+    if !ice.is_empty() {
+        let msg = SignalMsg::IceServers {
+            ice_servers: ice.servers().to_vec(),
+        };
+        let json = serde_json::to_string(&msg).context("encode ICE servers message")?;
+        socket
+            .send(Message::Text(json.into()))
+            .await
+            .context("send ICE servers to browser")?;
+    }
 
     let signaling = tokio::spawn(signaling_loop(socket, webrtcbin, events_rx).instrument(Span::current()));
     let _abort_signaling = AbortOnDrop(signaling.abort_handle());
@@ -335,6 +359,7 @@ fn build_stream(
     width: u16,
     height: u16,
     settings: &EncoderSettings,
+    ice: &IceServers,
     counters: Option<&Arc<Session>>,
 ) -> anyhow::Result<StreamParts> {
     let encoder = H264Pipeline::build(width, height, settings, WEBRTC_TAIL, true).context("build WebRTC pipeline")?;
@@ -348,6 +373,18 @@ fn build_stream(
         .pipeline()
         .by_name("modeb-webrtc")
         .context("pipeline missing modeb-webrtc")?;
+    // Before READY, so the ICE agent gathers server-reflexive and relay candidates from the start.
+    let stun = ice.stun_server();
+    if let Some(stun) = &stun {
+        webrtcbin.set_property("stun-server", stun.as_str());
+    }
+    let turn_uris = ice.turn_uris();
+    for uri in &turn_uris {
+        if !webrtcbin.emit_by_name::<bool>("add-turn-server", &[uri]) {
+            bail!("webrtcbin rejected a minted TURN server");
+        }
+    }
+    info!(?stun, turn_servers = turn_uris.len(), "Configured ICE servers");
     let translator = Arc::new(InputTranslator::new(width, height).context("load keyboard scancode table")?);
     debug!(
         key_codes = translator.key_count(),
@@ -472,6 +509,7 @@ fn handle_browser_message(webrtcbin: &gst::Element, text: &str) -> anyhow::Resul
         }
         SignalMsg::Offer { .. } => bail!("unexpected SDP offer from browser; the broker is the offerer"),
         SignalMsg::Error { .. } => bail!("unexpected error message from browser"),
+        SignalMsg::IceServers { .. } => bail!("unexpected ICE servers message from browser"),
     }
     Ok(())
 }

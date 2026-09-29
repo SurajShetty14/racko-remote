@@ -651,6 +651,7 @@ dependencies = [
  "ironrdp-tokio",
  "metrics",
  "metrics-exporter-prometheus",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

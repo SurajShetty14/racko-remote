@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         registry: Arc::clone(&registry),
         metrics,
     };
-    let modeb_routes = modeb_routes(&config, &registry);
+    let modeb_routes = modeb_routes(&config, &registry).await;
     tokio::spawn(async move {
         if let Err(err) = broker::api::serve(management_bind, api_state, modeb_routes).await {
             tracing::error!(error = %err, "management API stopped");
@@ -62,22 +62,35 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Mode B signaling routes, or none when Mode B cannot start (Mode C keeps running).
+///
+/// Mode B needs a working Cloudflare TURN key: one set of credentials is minted here so a wrong
+/// key or token disables Mode B at startup instead of failing every browser.
 #[cfg(feature = "modeb-encode")]
-fn modeb_routes(config: &Arc<Config>, registry: &Arc<Registry>) -> axum::Router {
-    use broker::modeb::{CredentialResolver, EnvCredentials, ModeBService, ModeBServiceConfig, SIGNALING_PATH};
+async fn modeb_routes(config: &Arc<Config>, registry: &Arc<Registry>) -> axum::Router {
+    use anyhow::Context as _;
+    use broker::modeb::{
+        CredentialResolver, EnvCredentials, ModeBService, ModeBServiceConfig, SIGNALING_PATH, TurnMinter,
+    };
 
     let fallback = EnvCredentials::load();
     let fallback_enabled = fallback.is_some();
-    let service = ModeBServiceConfig::load().and_then(|settings| {
+    let service = async {
+        let settings = ModeBServiceConfig::load()?;
+        let turn = TurnMinter::load()?;
+        turn.mint().await.context("mint test TURN credentials")?;
+        let turn_ttl_secs = turn.ttl_secs();
         let fallback = fallback.map(|credentials| Arc::new(credentials) as Arc<dyn CredentialResolver>);
-        ModeBService::new(Arc::clone(config), settings, Arc::clone(registry), fallback)
-    });
+        let service = ModeBService::new(Arc::clone(config), settings, Arc::clone(registry), fallback, turn)?;
+        anyhow::Ok((service, turn_ttl_secs))
+    }
+    .await;
     match service {
-        Ok(service) => {
+        Ok((service, turn_ttl_secs)) => {
             info!(
                 path = SIGNALING_PATH,
                 max_sessions = service.settings().max_sessions,
                 encoder = ?service.settings().encoder,
+                turn_ttl_secs,
                 fallback_credentials = fallback_enabled,
                 "Mode B WebRTC signaling enabled"
             );
@@ -97,7 +110,7 @@ fn modeb_routes(config: &Arc<Config>, registry: &Arc<Registry>) -> axum::Router 
 }
 
 #[cfg(not(feature = "modeb-encode"))]
-fn modeb_routes(_config: &Arc<Config>, _registry: &Arc<Registry>) -> axum::Router {
+async fn modeb_routes(_config: &Arc<Config>, _registry: &Arc<Registry>) -> axum::Router {
     info!("Mode B not built in; rebuild with --features modeb-encode to serve /modeb/webrtc");
     axum::Router::new()
 }

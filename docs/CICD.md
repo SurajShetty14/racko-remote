@@ -73,6 +73,7 @@ sudo chmod 600 /opt/racko/broker.env
 Edit `RDP_TARGET` for the lab VM.
 `MANAGEMENT_ADDR` must stay on `127.0.0.1:9091` so deploy health checks can reach `/healthz`.
 Optional: `RDP_ALLOWED_TARGETS` (comma-separated `host:port`) allows more VMs for both modes, and `MODEB_MAX_SESSIONS` (default 5) caps concurrent Mode B sessions below the GPU's NVENC limit.
+Mode B also needs `TURN_KEY_ID` and `TURN_API_TOKEN` (a Cloudflare TURN key): the broker mints short-lived STUN/TURN credentials for each session and hands them to the browser, so the token never leaves this file. Without them Mode B stays disabled; see `broker/.env.example`.
 Mode B signs in with the credentials each user enters on the connect page.
 Setting `RDP_USERNAME` / `RDP_PASSWORD` adds a fallback for users who leave both fields blank, which gives them that account's desktop without signing in; leave them unset in production.
 
@@ -121,7 +122,6 @@ In the repo, open **Settings → Environments → New environment**, name it `pr
 | `VITE_GATEWAY_URL` | `wss://<domain>/ws` | WebSocket the browser opens |
 | `VITE_BROKER_API_BASE` | `https://<domain>/api` | Dashboard session API |
 | `VITE_MODEB_SIGNALING_URL` (optional) | `wss://<domain>/modeb/webrtc` | Mode B signaling; derived from `VITE_BROKER_API_BASE` when unset |
-
 The deploy job sets `environment: production` and passes these secrets into the `racko-remote` Vite build, then refuses to continue if either required one is empty.
 Do not commit them.
 

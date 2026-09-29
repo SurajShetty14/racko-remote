@@ -5,6 +5,7 @@
 //! The browser's first message carries the RDP credentials for this session (never the URL):
 //! `{"type":"auth","username":…,"password":…,"domain":…}`. When it sends an empty username and
 //! password, the optional fallback [`CredentialResolver`] is used; otherwise the session is refused.
+//! Each accepted session then mints its own Cloudflare TURN credentials ([`TurnMinter`]).
 //! Sessions register in the shared [`Registry`] as mode B, so the management API lists
 //! and kills them like relays.
 
@@ -25,7 +26,7 @@ use tracing::{Instrument as _, error, info, info_span, warn};
 use crate::config::{Config, broker_dotenv_path, dotenv_map, split_host_port};
 use crate::modeb::encode::EncoderSettings;
 use crate::modeb::webrtc::{AUTH_FAILED, init_gstreamer, send_error, stream_session};
-use crate::modeb::{CredentialResolver, ModeBConfig, RdpCredentials};
+use crate::modeb::{CredentialResolver, ModeBConfig, RdpCredentials, TurnMinter};
 use crate::registry::{Registry, SessionMode};
 
 /// Signaling route on the management HTTP server.
@@ -82,6 +83,7 @@ pub struct ModeBService {
     settings: ModeBServiceConfig,
     registry: Arc<Registry>,
     fallback_credentials: Option<Arc<dyn CredentialResolver>>,
+    turn: TurnMinter,
     slots: Arc<Semaphore>,
 }
 
@@ -90,12 +92,13 @@ impl ModeBService {
     /// serving Mode C without Mode B.
     ///
     /// `fallback_credentials` signs in for browsers that send no credentials; with `None`,
-    /// every session needs browser credentials.
+    /// every session needs browser credentials. `turn` mints each session's STUN/TURN servers.
     pub fn new(
         config: Arc<Config>,
         settings: ModeBServiceConfig,
         registry: Arc<Registry>,
         fallback_credentials: Option<Arc<dyn CredentialResolver>>,
+        turn: TurnMinter,
     ) -> anyhow::Result<Self> {
         init_gstreamer()?;
         let slots = Arc::new(Semaphore::new(settings.max_sessions));
@@ -104,6 +107,7 @@ impl ModeBService {
             settings,
             registry,
             fallback_credentials,
+            turn,
             slots,
         })
     }
@@ -225,6 +229,15 @@ impl ModeBService {
             return;
         };
 
+        let ice = match self.turn.mint().await {
+            Ok(ice) => ice,
+            Err(err) => {
+                error!(%client_ip, %dest, error = format!("{err:#}"), "Rejected Mode B session: TURN credential minting failed");
+                send_error(&mut socket, "Could not get relay (TURN) credentials; try again later").await;
+                return;
+            }
+        };
+
         let username = credentials.username.clone();
         let label = format!("{host}:{port}");
         let rdp = ModeBConfig::for_target(
@@ -243,6 +256,7 @@ impl ModeBService {
                 %client_ip,
                 %username,
                 credentials = source,
+                turn_servers = ice.turn_count(),
                 active = self.active_sessions(),
                 max_sessions,
                 "Mode B session starting"
@@ -261,7 +275,7 @@ impl ModeBService {
             .spawn(move || {
                 let session = async move {
                     tokio::select! {
-                        result = stream_session(socket, &rdp, &encoder, Some(counters)) => result,
+                        result = stream_session(socket, &rdp, &encoder, &ice, Some(counters)) => result,
                         _ = kill_rx.wait_for(|killed| *killed) => {
                             info!("Mode B session killed from the management API");
                             Ok(())

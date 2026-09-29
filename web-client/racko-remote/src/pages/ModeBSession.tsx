@@ -222,5 +222,6 @@ function linkLabel(link: LinkState): string {
 
 function statusText(hostname: string, state: ModeBState): string {
   const size = state.video == null ? '' : ` · ${state.video.width}×${state.video.height}`;
-  return `${hostname}${size} · ICE ${state.ice} · peer ${state.peer} · input ${state.input}`;
+  const route = state.route == null ? '' : ` via ${state.route}`;
+  return `${hostname}${size} · ICE ${state.ice}${route} · peer ${state.peer} · input ${state.input}`;
 }

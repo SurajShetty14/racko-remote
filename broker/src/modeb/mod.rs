@@ -9,6 +9,7 @@
 mod connect;
 mod credentials;
 mod framebuffer;
+mod ice;
 
 #[cfg(feature = "modeb-encode")]
 mod encode;
@@ -22,6 +23,7 @@ mod webrtc;
 pub use connect::{ModeBConfig, run};
 pub use credentials::{CredentialResolver, EnvCredentials, RdpCredentials};
 pub use framebuffer::FRAME_PNG_PATH;
+pub use ice::{IceServer, IceServers, TurnMinter};
 
 #[cfg(feature = "modeb-encode")]
 pub use encode::{ENCODED_MP4_PATH, EncodeConfig, EncoderSettings, RateControl, run_encode};

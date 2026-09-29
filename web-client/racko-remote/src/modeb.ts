@@ -57,11 +57,14 @@ type SignalingMessage =
   | { type: 'auth'; username: string; password: string; domain: string }
   | { type: 'offer' | 'answer'; sdp: string }
   | { type: 'ice'; candidate: string; sdpMLineIndex: number | null }
+  | { type: 'ice-servers'; iceServers: RTCIceServer[] }
   | { type: 'error'; message: string };
 
 export type ModeBState = {
   signaling: 'connecting' | 'open' | 'closed';
   ice: RTCIceConnectionState;
+  /** Local candidate type of the selected pair: `host`, `srflx`, `prflx`, or `relay` (TURN). */
+  route: string | null;
   peer: RTCPeerConnectionState;
   input: RTCDataChannelState;
   video: { width: number; height: number } | null;
@@ -76,6 +79,7 @@ export type ModeBSessionHandle = {
 export const INITIAL_MODEB_STATE: ModeBState = {
   signaling: 'connecting',
   ice: 'new',
+  route: null,
   peer: 'new',
   input: 'connecting',
   video: null,
@@ -114,8 +118,8 @@ export function openModeBSession(
     }
   };
 
-  // Host candidates only: no STUN/TURN yet.
-  const pc = new RTCPeerConnection({ iceServers: [] });
+  // The broker sends this session's minted STUN/TURN servers before its offer ("ice-servers").
+  const pc = new RTCPeerConnection();
 
   // The broker's webrtcbin creates the same pre-negotiated channel (label "input", id 0) before
   // its offer; creating it here before the answer binds this side to that SCTP stream.
@@ -132,6 +136,12 @@ export function openModeBSession(
   pc.oniceconnectionstatechange = () => {
     console.info('Mode B ICE connection state:', pc.iceConnectionState);
     update({ ice: pc.iceConnectionState });
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      void selectedRoute().then((route) => {
+        console.info('Mode B ICE route:', route);
+        update({ route });
+      });
+    }
   };
   pc.onconnectionstatechange = () => {
     console.info('Mode B peer connection state:', pc.connectionState);
@@ -253,7 +263,11 @@ export function openModeBSession(
   async function onSignal(data: string) {
     try {
       const message = JSON.parse(data) as SignalingMessage;
-      if (message.type === 'offer') {
+      if (message.type === 'ice-servers') {
+        // Before the answer, so gathering for it already uses TURN.
+        pc.setConfiguration({ iceServers: message.iceServers });
+        console.info('Mode B ICE servers from broker:', message.iceServers.length);
+      } else if (message.type === 'offer') {
         await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
@@ -269,6 +283,29 @@ export function openModeBSession(
       if (!closed) {
         console.error('Mode B signaling handling failed', error);
       }
+    }
+  }
+
+  async function selectedRoute(): Promise<string | null> {
+    try {
+      const stats = await pc.getStats();
+      let pairId: string | undefined;
+      stats.forEach((report) => {
+        // Chrome/Safari name the pair on the transport; Firefox marks the pair itself.
+        if (report.type === 'transport' && report.selectedCandidatePairId != null) {
+          pairId = report.selectedCandidatePairId;
+        } else if (
+          report.type === 'candidate-pair' &&
+          pairId == null &&
+          (report.selected === true || (report.nominated === true && report.state === 'succeeded'))
+        ) {
+          pairId = report.id;
+        }
+      });
+      const pair = pairId == null ? undefined : stats.get(pairId);
+      return pair == null ? null : (stats.get(pair.localCandidateId)?.candidateType ?? null);
+    } catch {
+      return null;
     }
   }
 
