@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Mode B encode + WebRTC probes on Linux (Ubuntu box or CI).
+# Build the broker with Mode B (GStreamer/NVENC) plus the Mode B probes on Linux (Ubuntu box or CI).
 # Never runs sudo/apt — install GStreamer packages once on the box by hand.
 set -euo pipefail
 
@@ -46,12 +46,13 @@ EOF
   exit 1
 fi
 
-echo "GStreamer present (gstreamer-1.0 + webrtc/sdp + nvh264enc); building Mode B probes"
-cargo build -p broker --features modeb-encode --bin modeb_encode_probe --bin modeb_webrtc_probe --locked
+echo "GStreamer present (gstreamer-1.0 + webrtc/sdp + nvh264enc); building broker + Mode B probes"
+cargo build -p broker --features modeb-encode --bin broker --bin modeb_encode_probe --bin modeb_webrtc_probe --locked
 
 echo
 echo "Run (after editing broker/.env or exporting RDP_*):"
+echo "  cargo run -p broker --features modeb-encode --bin broker               # Mode C on :7171, Mode B at ws://<MANAGEMENT_ADDR>/modeb/webrtc"
 echo "  cargo run -p broker --features modeb-encode --bin modeb_encode_probe   # MP4 -> /tmp/modeb-encoded.mp4"
-echo "  cargo run -p broker --features modeb-encode --bin modeb_webrtc_probe   # open http://127.0.0.1:8080/modeb.html"
+echo "  cargo run -p broker --features modeb-encode --bin modeb_webrtc_probe   # deprecated single-session probe"
 echo "While running, check NVENC load:"
 echo "  nvidia-smi dmon -s u"

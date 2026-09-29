@@ -1,5 +1,19 @@
+import { BROKER_BASE_URL } from './broker';
+
+/**
+ * Mode B signaling on the main broker. Defaults to the broker API origin:
+ * `ws://localhost:9090/modeb/webrtc` in dev, `wss://<domain>/modeb/webrtc` behind nginx.
+ */
 export const MODEB_SIGNALING_URL: string =
-  import.meta.env.VITE_MODEB_SIGNALING_URL || 'ws://localhost:8080/webrtc';
+  import.meta.env.VITE_MODEB_SIGNALING_URL || defaultSignalingUrl();
+
+function defaultSignalingUrl(): string {
+  const url = new URL(BROKER_BASE_URL, window.location.href);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.pathname = '/modeb/webrtc';
+  url.search = '';
+  return url.toString();
+}
 
 /** Router state handed from the connect page to the Mode B session page. */
 export type ModeBRequest = {
@@ -18,7 +32,8 @@ export type InputMessage =
 
 type SignalingMessage =
   | { type: 'offer' | 'answer'; sdp: string }
-  | { type: 'ice'; candidate: string; sdpMLineIndex: number | null };
+  | { type: 'ice'; candidate: string; sdpMLineIndex: number | null }
+  | { type: 'error'; message: string };
 
 export type ModeBState = {
   signaling: 'connecting' | 'open' | 'closed';
@@ -46,11 +61,13 @@ export const INITIAL_MODEB_STATE: ModeBState = {
 const BUTTONS: readonly MouseButtonName[] = ['left', 'middle', 'right'];
 
 /**
- * Opens a Mode B WebRTC session: signaling WebSocket, receive-only H.264 video into `video`,
- * and the pre-negotiated "input" data channel fed by mouse and keyboard events on `video`.
+ * Opens a Mode B WebRTC session to `dest` (host:port): signaling WebSocket, receive-only H.264
+ * video into `video`, and the pre-negotiated "input" data channel fed by mouse and keyboard
+ * events on `video`. The broker signs in with its own credentials.
  */
 export function openModeBSession(
   video: HTMLVideoElement,
+  dest: string,
   onState: (state: ModeBState) => void,
 ): ModeBSessionHandle {
   let state = INITIAL_MODEB_STATE;
@@ -63,7 +80,9 @@ export function openModeBSession(
     onState(state);
   };
 
-  const ws = new WebSocket(MODEB_SIGNALING_URL);
+  const signalingUrl = new URL(MODEB_SIGNALING_URL);
+  signalingUrl.searchParams.set('dest', dest);
+  const ws = new WebSocket(signalingUrl);
   const send = (message: SignalingMessage) => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(message));
@@ -213,6 +232,8 @@ export function openModeBSession(
         send({ type: 'answer', sdp: pc.localDescription?.sdp ?? answer.sdp ?? '' });
       } else if (message.type === 'ice') {
         await pc.addIceCandidate({ candidate: message.candidate, sdpMLineIndex: message.sdpMLineIndex });
+      } else if (message.type === 'error') {
+        update({ error: message.message });
       } else {
         console.warn('Unexpected Mode B signaling message', data);
       }

@@ -28,7 +28,7 @@ impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 pub(super) type UpgradedFramed = TokioFramed<Box<dyn AsyncReadWrite + Unpin + Send + Sync>>;
 
 /// Bastion-side RDP target and credentials (never sent to the browser client).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModeBConfig {
     pub host: String,
     pub port: u16,
@@ -97,8 +97,46 @@ impl ModeBConfig {
         })
     }
 
+    /// Settings for one broker-hosted session to an already allow-listed target.
+    pub fn for_target(
+        host: String,
+        port: u16,
+        credentials: super::RdpCredentials,
+        tls_insecure: bool,
+        desktop_width: u16,
+        desktop_height: u16,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            username: credentials.username,
+            password: credentials.password,
+            domain: credentials.domain,
+            tls_insecure,
+            desktop_width,
+            desktop_height,
+            frame_path: PathBuf::from(FRAME_PNG_PATH),
+            dump_interval: Duration::from_secs(2),
+        }
+    }
+
     pub(super) fn destination_label(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+}
+
+impl core::fmt::Debug for ModeBConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ModeBConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("tls_insecure", &self.tls_insecure)
+            .field("desktop_width", &self.desktop_width)
+            .field("desktop_height", &self.desktop_height)
+            .finish_non_exhaustive()
     }
 }
 
@@ -218,7 +256,7 @@ fn build_connector_config(config: &ModeBConfig) -> anyhow::Result<ironrdp_connec
         monitor_layout: None,
         bitmap: None,
         client_build: 0,
-        client_name: "racko-modeb-probe".to_owned(),
+        client_name: "racko-modeb".to_owned(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
         platform: MajorPlatformType::UNIX,
         enable_server_pointer: false,

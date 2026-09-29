@@ -21,9 +21,23 @@ Vite reads them from GitHub Actions secrets at deploy time.
 Broker listen addresses (set in `broker.env`):
 
 - Relay (browser WebSocket): `BIND_ADDR=0.0.0.0:7171`
-- Management / health / metrics: `MANAGEMENT_ADDR=127.0.0.1:9091`
+- Management / health / metrics / Mode B signaling: `MANAGEMENT_ADDR=127.0.0.1:9091`
 
-nginx serves `/` from `/var/www/racko-remote` and proxies `/ws` and `/api/` to the broker.
+nginx serves `/` from `/var/www/racko-remote` and proxies `/ws`, `/api/`, and `/modeb/` to the broker.
+`/modeb/` carries the Mode B signaling WebSocket, so its location needs the upgrade headers:
+
+```nginx
+location /modeb/ {
+    proxy_pass http://127.0.0.1:9091;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 1h;
+}
+```
+
+The deploy builds the broker with `--features modeb-encode`, so the box needs the GStreamer development packages that [`scripts/build-modeb-encode.sh`](../scripts/build-modeb-encode.sh) checks for.
+If GStreamer or its WebRTC plugins are missing at runtime, the broker logs an error and serves Mode C only.
 
 ## One-time bootstrap
 
@@ -60,6 +74,8 @@ sudo chmod 600 /opt/racko/broker.env
 
 Edit `RDP_TARGET` and credentials for the lab VM.
 `MANAGEMENT_ADDR` must stay on `127.0.0.1:9091` so deploy health checks can reach `/healthz`.
+Optional: `RDP_ALLOWED_TARGETS` (comma-separated `host:port`) allows more VMs for both modes, and `MODEB_MAX_SESSIONS` (default 5) caps concurrent Mode B sessions below the GPU's NVENC limit.
+Mode B signs in to every allowed VM with `RDP_USERNAME` / `RDP_PASSWORD`.
 
 ### systemd unit
 
@@ -105,8 +121,9 @@ In the repo, open **Settings → Environments → New environment**, name it `pr
 | --- | --- | --- |
 | `VITE_GATEWAY_URL` | `wss://<domain>/ws` | WebSocket the browser opens |
 | `VITE_BROKER_API_BASE` | `https://<domain>/api` | Dashboard session API |
+| `VITE_MODEB_SIGNALING_URL` (optional) | `wss://<domain>/modeb/webrtc` | Mode B signaling; derived from `VITE_BROKER_API_BASE` when unset |
 
-The deploy job sets `environment: production` and passes both secrets into the `racko-remote` Vite build, then refuses to continue if either is empty.
+The deploy job sets `environment: production` and passes these secrets into the `racko-remote` Vite build, then refuses to continue if either required one is empty.
 Do not commit them.
 
 ## What a deploy does

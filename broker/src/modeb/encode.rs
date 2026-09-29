@@ -406,9 +406,15 @@ impl H264Pipeline {
     }
 
     pub(super) fn play(&self) -> anyhow::Result<()> {
-        self.pipeline
-            .set_state(gst::State::Playing)
-            .context("set pipeline Playing")?;
+        self.set_state(gst::State::Playing)
+    }
+
+    /// Change state, reporting the bus error behind a refusal (such as NVENC failing to open).
+    pub(super) fn set_state(&self, state: gst::State) -> anyhow::Result<()> {
+        if self.pipeline.set_state(state).is_err() {
+            drain_bus(&self.pipeline)?;
+            bail!("pipeline refused state {state:?}");
+        }
         Ok(())
     }
 
@@ -539,7 +545,25 @@ fn drain_bus(pipeline: &gst::Pipeline) -> anyhow::Result<()> {
     ]) {
         match msg.view() {
             gst::MessageView::Error(err) => {
-                bail!("gstreamer error: {} ({})", err.error(), err.debug().unwrap_or_default());
+                let source = err.src().map(|src| src.name().to_string()).unwrap_or_default();
+                let is_nvenc = source == "modeb-enc"
+                    && err
+                        .src()
+                        .and_then(|src| src.downcast_ref::<gst::Element>())
+                        .and_then(|element| element.factory())
+                        .is_some_and(|factory| factory.name() == EncoderKind::NvH264.element_name());
+                if is_nvenc {
+                    bail!(
+                        "nvh264enc failed: {} ({}); the GPU may be at its concurrent NVENC session limit",
+                        err.error(),
+                        err.debug().unwrap_or_default()
+                    );
+                }
+                bail!(
+                    "gstreamer error from {source}: {} ({})",
+                    err.error(),
+                    err.debug().unwrap_or_default()
+                );
             }
             gst::MessageView::Warning(warn_msg) => {
                 warn!(

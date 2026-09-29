@@ -1,3 +1,6 @@
+//! Deprecated: the main `broker` binary serves Mode B at `/modeb/webrtc` with
+//! concurrent sessions and per-session targets. Kept compiling for local debugging.
+//!
 //! Mode B Phase 3a probe: stream the decoded RDP framebuffer to one browser over WebRTC.
 //!
 //! ```text

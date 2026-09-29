@@ -29,7 +29,7 @@ use tracing::{info, warn};
 use x509_cert::der::Encode as _;
 
 use crate::config::{Config, split_host_port};
-use crate::registry::{LiveSession, Registry};
+use crate::registry::{LiveSession, Registry, SessionMode};
 
 const FIRST_MESSAGE: Duration = Duration::from_secs(30);
 const SERVER_CONNECT: Duration = Duration::from_secs(10);
@@ -117,7 +117,7 @@ async fn serve(
             %peer,
             destination = %destination,
             allowed = %config.target_label(),
-            "destination is not the configured RDP target"
+            "destination is not an allowed RDP target"
         );
         send_pdu(&mut ws, &RDCleanPathPdu::new_general_error()).await?;
         return Ok(());
@@ -200,7 +200,7 @@ async fn serve(
     info!(conn_id, %peer, destination = %destination, server_addr = %server_addr, "RDCleanPath complete, piping bytes");
 
     let destination_label = format!("{host}:{port}");
-    let live = registry.register(destination_label, peer.ip().to_string());
+    let live = registry.register(SessionMode::C, destination_label, peer.ip().to_string());
     pipe(ws, tls, conn_id, peer, &live, config.idle_timeout).await
 }
 

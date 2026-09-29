@@ -242,7 +242,8 @@ button:hover {
 }
 
 .link-state.lost,
-.link-state.error {
+.link-state.error,
+.link-state.taken-over {
   color: #fca5a5;
 }
 

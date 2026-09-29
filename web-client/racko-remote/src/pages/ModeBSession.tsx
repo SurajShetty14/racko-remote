@@ -43,7 +43,7 @@ export function ModeBSession() {
     // StrictMode mounts effects twice in dev, and the signaling server serves a single socket per
     // session, so only open it once the mount has settled.
     const timer = window.setTimeout(() => {
-      session = openModeBSession(video, setState);
+      session = openModeBSession(video, hostname, setState);
       sessionRef.current = session;
     }, 0);
     return () => {

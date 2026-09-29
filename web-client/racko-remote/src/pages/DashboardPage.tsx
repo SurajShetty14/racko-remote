@@ -106,6 +106,7 @@ export function DashboardPage() {
           <table>
             <thead>
               <tr>
+                <th>Mode</th>
                 <th>Destination</th>
                 <th>Client IP</th>
                 <th>Duration</th>
@@ -117,6 +118,7 @@ export function DashboardPage() {
             <tbody>
               {sessions.map((session) => (
                 <tr key={session.id}>
+                  <td title={session.mode === 'B' ? 'GPU stream' : 'Browser decode'}>{session.mode}</td>
                   <td>{session.dest}</td>
                   <td>{session.clientIp}</td>
                   <td>{formatDuration(session.durationSecs)}</td>

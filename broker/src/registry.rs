@@ -1,4 +1,5 @@
-//! In-memory registry of relays that have finished the RDCleanPath handshake.
+//! In-memory registry of live sessions: Mode C relays that finished the RDCleanPath
+//! handshake and Mode B WebRTC streams.
 
 use std::sync::Arc;
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -10,10 +11,20 @@ use serde::Serialize;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-/// One live relay. Byte counters and `last_activity` are atomics so the pipe
-/// does not take the registry lock.
+/// How the browser reaches the desktop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum SessionMode {
+    /// RDCleanPath relay; the browser decodes RDP itself.
+    C,
+    /// The broker decodes RDP and streams H.264 over WebRTC.
+    B,
+}
+
+/// One live session. Byte counters and `last_activity` are atomics so the data
+/// path does not take the registry lock.
 pub struct Session {
     pub id: Uuid,
+    pub mode: SessionMode,
     pub destination: String,
     pub client_ip: String,
     pub started_at: DateTime<Utc>,
@@ -79,6 +90,7 @@ impl Drop for LiveSession {
 #[serde(rename_all = "camelCase")]
 pub struct SessionView {
     pub id: Uuid,
+    pub mode: SessionMode,
     pub dest: String,
     pub client_ip: String,
     pub started_at: String,
@@ -104,12 +116,13 @@ impl Registry {
         }
     }
 
-    pub fn register(self: &Arc<Self>, destination: String, client_ip: String) -> LiveSession {
+    pub fn register(self: &Arc<Self>, mode: SessionMode, destination: String, client_ip: String) -> LiveSession {
         let id = Uuid::new_v4();
         let (kill, kill_rx) = watch::channel(false);
         let now = Utc::now();
         let session = Arc::new(Session {
             id,
+            mode,
             destination: destination.clone(),
             client_ip: client_ip.clone(),
             started_at: now,
@@ -122,7 +135,7 @@ impl Registry {
         self.sessions.insert(id, Arc::clone(&session));
         metrics::counter!("racko_sessions_total").increment(1);
         metrics::gauge!("racko_active_sessions").set(self.sessions.len() as f64);
-        tracing::info!(session_id = %id, dest = %destination, client_ip = %client_ip, "session registered");
+        tracing::info!(session_id = %id, ?mode, dest = %destination, client_ip = %client_ip, "session registered");
         LiveSession {
             session,
             kill_rx,
@@ -150,6 +163,7 @@ impl Registry {
                 let duration = (now - session.started_at).num_seconds();
                 SessionView {
                     id: session.id,
+                    mode: session.mode,
                     dest: session.destination.clone(),
                     client_ip: session.client_ip.clone(),
                     started_at: session.started_at.to_rfc3339_opts(SecondsFormat::Secs, true),

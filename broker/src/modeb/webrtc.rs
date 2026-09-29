@@ -1,23 +1,28 @@
-//! Phase 3a: stream the decoded RDP framebuffer to one browser over WebRTC.
+//! Stream a decoded RDP framebuffer to a browser over WebRTC.
 //!
 //! `appsrc(RGBA) → videoconvert → nvh264enc → h264parse → rtph264pay → webrtcbin`
 //!
 //! webrtcbin is the offerer and the browser answers. Signaling is JSON over a
-//! WebSocket at `/webrtc`, with the same messages as GStreamer's
-//! [webrtc sendrecv example]:
+//! WebSocket, with the same messages as GStreamer's [webrtc sendrecv example]:
 //! `{"type":"offer"|"answer","sdp":…}` and `{"type":"ice","candidate":…,"sdpMLineIndex":…}`.
+//! The broker also sends `{"type":"error","message":…}` before closing when a session cannot start.
 //! No STUN/TURN is configured, so only host candidates are gathered and the
-//! browser must reach the box directly (Phase 3a tests from the box itself).
+//! browser must reach the box directly.
 //!
-//! Phase 4 adds an ordered `input` data channel (pre-negotiated, id 0) carrying
-//! browser mouse/keyboard JSON back to the RDP session (see [`super::input`]).
+//! An ordered `input` data channel (pre-negotiated, id 0) carries browser
+//! mouse/keyboard JSON back to the RDP session (see [`super::input`]).
 //! webrtcbin creates it before the first offer so the SDP has an `m=application`
 //! section; the page creates the matching channel before answering.
+//!
+//! [`stream_session`] runs one session per signaling WebSocket. The broker's
+//! `/modeb/webrtc` route ([`super::service`]) calls it once per browser; the
+//! deprecated `modeb_webrtc_probe` ([`run_webrtc`]) calls it once and exits.
 //!
 //! [webrtc sendrecv example]: https://gitlab.freedesktop.org/gstreamer/gstreamer/-/tree/main/subprojects/gst-examples/webrtc/sendrecv
 
 use core::net::SocketAddr;
 use core::pin::pin;
+use core::time::Duration;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, anyhow, bail};
@@ -37,21 +42,25 @@ use ironrdp_input::Operation;
 use ironrdp_session::image::DecodedImage;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, Span, debug, info, warn};
 
 use crate::config::{broker_dotenv_path, dotenv_map};
 use crate::modeb::ModeBConfig;
 use crate::modeb::connect;
 use crate::modeb::encode::{EncoderSettings, H264Pipeline};
 use crate::modeb::input::InputTranslator;
+use crate::registry::Session;
 
-/// Label and pre-negotiated SCTP stream id of the browser input channel (must match `modeb.html`).
+/// Label and pre-negotiated SCTP stream id of the browser input channel (must match the web client).
 const INPUT_CHANNEL_LABEL: &str = "input";
 const INPUT_CHANNEL_ID: i32 = 0;
 
 const MODEB_HTML: &str = include_str!("../../static/modeb.html");
 
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
+
+/// TCP + TLS + CredSSP + capability exchange with the target VM.
+const RDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Linked after the encoder. The RTP capsfilter lets webrtcbin build the offer
 /// before the first encoded buffer reaches it.
@@ -76,7 +85,7 @@ const REQUIRED_ELEMENTS: &[&str] = &[
     "sctpdec",
 ];
 
-/// WebRTC probe settings.
+/// Settings for the deprecated standalone WebRTC probe.
 #[derive(Debug, Clone)]
 pub struct WebRtcConfig {
     /// HTTP + signaling listen address (serves `/modeb.html` and `/webrtc`).
@@ -115,6 +124,10 @@ enum SignalMsg {
         #[serde(rename = "sdpMLineIndex")]
         sdp_mline_index: u32,
     },
+    /// Broker to browser only: the session could not start.
+    Error {
+        message: String,
+    },
 }
 
 /// Posted from GStreamer threads to the signaling task.
@@ -126,15 +139,8 @@ enum PeerEvent {
 /// Hands the first browser WebSocket to the probe; later upgrades are rejected.
 type SessionSlot = Arc<Mutex<Option<oneshot::Sender<WebSocket>>>>;
 
-/// Serve the test page, wait for one browser, then stream the RDP session to it.
-pub async fn run_webrtc(rdp: ModeBConfig, webrtc: WebRtcConfig) -> anyhow::Result<()> {
-    info!(
-        target = %rdp.destination_label(),
-        bind = %webrtc.bind,
-        settings = ?webrtc.encoder,
-        "Mode B WebRTC probe starting (server-side auth)"
-    );
-
+/// Initialize GStreamer and fail with an install hint when WebRTC elements are missing.
+pub(super) fn init_gstreamer() -> anyhow::Result<()> {
     gst::init().context("gstreamer init")?;
     let missing: Vec<&str> = REQUIRED_ELEMENTS
         .iter()
@@ -147,6 +153,22 @@ pub async fn run_webrtc(rdp: ModeBConfig, webrtc: WebRtcConfig) -> anyhow::Resul
              gstreamer1.0-plugins-good and gstreamer1.0-plugins-bad"
         );
     }
+    Ok(())
+}
+
+/// Deprecated standalone probe: serve the test page, stream `RDP_TARGET` to one browser, exit.
+///
+/// The main broker serves Mode B at `/modeb/webrtc` with per-session targets.
+pub async fn run_webrtc(rdp: ModeBConfig, webrtc: WebRtcConfig) -> anyhow::Result<()> {
+    warn!("modeb_webrtc_probe is deprecated; the main broker serves Mode B at /modeb/webrtc");
+    info!(
+        target = %rdp.destination_label(),
+        bind = %webrtc.bind,
+        settings = ?webrtc.encoder,
+        "Mode B WebRTC probe starting (server-side auth)"
+    );
+
+    init_gstreamer()?;
 
     let (socket_tx, socket_rx) = oneshot::channel();
     let slot: SessionSlot = Arc::new(Mutex::new(Some(socket_tx)));
@@ -174,75 +196,7 @@ pub async fn run_webrtc(rdp: ModeBConfig, webrtc: WebRtcConfig) -> anyhow::Resul
         .context("test page server stopped before a browser connected")?;
     info!("Browser opened signaling WebSocket; connecting to RDP target");
 
-    let (connection_result, framed) = connect::connect(&rdp).await.context("Mode B connect")?;
-    let width = connection_result.desktop_size.width;
-    let height = connection_result.desktop_size.height;
-    info!(
-        width,
-        height,
-        pixel_format = "RGBA",
-        compression = ?connection_result.compression_type,
-        "Negotiated session parameters"
-    );
-
-    let mut encoder =
-        H264Pipeline::build(width, height, &webrtc.encoder, WEBRTC_TAIL, true).context("build WebRTC pipeline")?;
-    info!(
-        encoder = encoder.encoder_name(),
-        hardware = encoder.is_hardware(),
-        "Selected H.264 encoder element"
-    );
-
-    let webrtcbin = encoder
-        .pipeline()
-        .by_name("modeb-webrtc")
-        .context("pipeline missing modeb-webrtc")?;
-    let translator = Arc::new(InputTranslator::new(width, height).context("load keyboard scancode table")?);
-    info!(
-        key_codes = translator.key_count(),
-        "Loaded web client KeyboardEvent.code to scancode table"
-    );
-
-    // webrtcbin only creates data channels from READY; doing it before PLAYING
-    // puts the channel in the first offer instead of forcing a renegotiation.
-    encoder
-        .pipeline()
-        .set_state(gst::State::Ready)
-        .context("set pipeline Ready")?;
-    let (input_tx, input_rx) = mpsc::unbounded_channel();
-    let _input_channel = connect_input_channels(&webrtcbin, &translator, &input_tx)?;
-    drop(input_tx);
-
-    let (events_tx, events_rx) = mpsc::unbounded_channel();
-    connect_webrtcbin_signals(&webrtcbin, &events_tx);
-    drop(events_tx);
-
-    // PLAYING links webrtcbin's sink pad, which fires on-negotiation-needed.
-    encoder.play()?;
-
-    let signaling = tokio::spawn(signaling_loop(socket, webrtcbin, events_rx));
-    let stop = pin!(async move {
-        match signaling.await {
-            Ok(result) => result,
-            Err(err) => Err(anyhow!("signaling task failed: {err}")),
-        }
-    });
-
-    let mut image = DecodedImage::new(PixelFormat::RgbA32, width, height);
-    let result = connect::active_session_encode(
-        connection_result,
-        framed,
-        &mut image,
-        webrtc.encoder.fps,
-        stop,
-        Some(input_rx),
-        &mut encoder,
-    )
-    .await
-    .context("Mode B WebRTC session");
-
-    info!(frames_pushed = encoder.frames_pushed(), "Mode B WebRTC session ended");
-    drop(encoder);
+    let result = stream_session(socket, &rdp, &webrtc.encoder, None).await;
     server.abort();
     result
 }
@@ -264,6 +218,188 @@ async fn signaling_upgrade(State(slot): State<SessionSlot>, ws: WebSocketUpgrade
             warn!("Probe stopped before the signaling WebSocket was handed off");
         }
     })
+}
+
+/// Connect to `rdp`, then stream it to the browser on `socket` until the browser
+/// leaves or the server ends the session.
+///
+/// Dropping the returned future tears the session down: the pipeline goes to NULL,
+/// webrtcbin, the RDP connection and the socket are released, and the signaling task is aborted.
+/// `counters` receives encoded video bytes (received) and browser input bytes (sent).
+///
+/// The future is not `Send` (IronRDP's connector and framed futures), so await it directly
+/// or on a current-thread runtime, not in a multi-thread `tokio::spawn`.
+pub(super) async fn stream_session(
+    mut socket: WebSocket,
+    rdp: &ModeBConfig,
+    settings: &EncoderSettings,
+    counters: Option<Arc<Session>>,
+) -> anyhow::Result<()> {
+    let connected = match tokio::time::timeout(RDP_CONNECT_TIMEOUT, connect::connect(rdp)).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("timed out after {}s", RDP_CONNECT_TIMEOUT.as_secs())),
+    };
+    let (connection_result, framed) = match connected {
+        Ok(connected) => connected,
+        Err(err) => {
+            send_error(&mut socket, "Could not connect to the remote desktop").await;
+            return Err(err.context("Mode B connect"));
+        }
+    };
+    let width = connection_result.desktop_size.width;
+    let height = connection_result.desktop_size.height;
+    info!(
+        width,
+        height,
+        pixel_format = "RGBA",
+        compression = ?connection_result.compression_type,
+        "Negotiated session parameters"
+    );
+
+    let parts = match build_stream(width, height, settings, counters.as_ref()) {
+        Ok(parts) => parts,
+        Err(err) => {
+            send_error(&mut socket, "Could not start the video stream").await;
+            return Err(err);
+        }
+    };
+    let StreamParts {
+        mut encoder,
+        webrtcbin,
+        input_channel,
+        input_rx,
+        events_rx,
+    } = parts;
+
+    let signaling = tokio::spawn(signaling_loop(socket, webrtcbin, events_rx).instrument(Span::current()));
+    let _abort_signaling = AbortOnDrop(signaling.abort_handle());
+    let stop = pin!(async move {
+        match signaling.await {
+            Ok(result) => result,
+            Err(err) => Err(anyhow!("signaling task failed: {err}")),
+        }
+    });
+
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, width, height);
+    let result = connect::active_session_encode(
+        connection_result,
+        framed,
+        &mut image,
+        settings.fps,
+        stop,
+        Some(input_rx),
+        &mut encoder,
+    )
+    .await
+    .context("Mode B WebRTC session");
+
+    info!(frames_pushed = encoder.frames_pushed(), "Mode B WebRTC session ended");
+    drop(input_channel);
+    drop(encoder);
+    result
+}
+
+/// Tell the browser why the session did not start, then close the socket.
+pub(super) async fn send_error(socket: &mut WebSocket, message: &str) {
+    let msg = SignalMsg::Error {
+        message: message.to_owned(),
+    };
+    if let Ok(json) = serde_json::to_string(&msg) {
+        let _ = socket.send(Message::Text(json.into())).await;
+    }
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+struct StreamParts {
+    encoder: H264Pipeline,
+    webrtcbin: gst::Element,
+    /// Our reference from `create-data-channel`, held until the session ends.
+    input_channel: gst_webrtc::WebRTCDataChannel,
+    input_rx: mpsc::UnboundedReceiver<Vec<Operation>>,
+    events_rx: mpsc::UnboundedReceiver<PeerEvent>,
+}
+
+/// Build the encode + WebRTC pipeline, wire the input channel and signaling callbacks, and start it.
+fn build_stream(
+    width: u16,
+    height: u16,
+    settings: &EncoderSettings,
+    counters: Option<&Arc<Session>>,
+) -> anyhow::Result<StreamParts> {
+    let encoder = H264Pipeline::build(width, height, settings, WEBRTC_TAIL, true).context("build WebRTC pipeline")?;
+    info!(
+        encoder = encoder.encoder_name(),
+        hardware = encoder.is_hardware(),
+        "Selected H.264 encoder element"
+    );
+
+    let webrtcbin = encoder
+        .pipeline()
+        .by_name("modeb-webrtc")
+        .context("pipeline missing modeb-webrtc")?;
+    let translator = Arc::new(InputTranslator::new(width, height).context("load keyboard scancode table")?);
+    debug!(
+        key_codes = translator.key_count(),
+        "Loaded web client KeyboardEvent.code to scancode table"
+    );
+
+    if let Some(session) = counters {
+        count_video_bytes(&encoder, session)?;
+    }
+
+    // webrtcbin only creates data channels from READY; doing it before PLAYING
+    // puts the channel in the first offer instead of forcing a renegotiation.
+    encoder.set_state(gst::State::Ready).context("set pipeline Ready")?;
+    let (input_tx, input_rx) = mpsc::unbounded_channel();
+    let input_channel = connect_input_channels(&webrtcbin, &translator, &input_tx, counters)?;
+    drop(input_tx);
+
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    connect_webrtcbin_signals(&webrtcbin, &events_tx);
+    drop(events_tx);
+
+    // PLAYING links webrtcbin's sink pad, which fires on-negotiation-needed.
+    encoder.play().context("start WebRTC pipeline")?;
+
+    Ok(StreamParts {
+        encoder,
+        webrtcbin,
+        input_channel,
+        input_rx,
+        events_rx,
+    })
+}
+
+/// Count RTP payload bytes leaving the payloader (before SRTP/UDP overhead) as bytes received.
+fn count_video_bytes(encoder: &H264Pipeline, session: &Arc<Session>) -> anyhow::Result<()> {
+    let pad = encoder
+        .pipeline()
+        .by_name("modeb-pay")
+        .context("pipeline missing modeb-pay")?
+        .static_pad("src")
+        .context("modeb-pay has no src pad")?;
+    let session = Arc::clone(session);
+    pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+        move |_pad, info| {
+            let bytes = match &info.data {
+                Some(gst::PadProbeData::Buffer(buffer)) => buffer.size(),
+                Some(gst::PadProbeData::BufferList(list)) => list.calculate_size(),
+                _ => 0,
+            };
+            session.add_received(u64::try_from(bytes).unwrap_or(u64::MAX));
+            gst::PadProbeReturn::Ok
+        },
+    );
+    Ok(())
+}
+
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Relay SDP/ICE between the browser and webrtcbin until either side ends the session.
@@ -317,28 +453,35 @@ fn handle_browser_message(webrtcbin: &gst::Element, text: &str) -> anyhow::Resul
             sdp_mline_index,
         } => {
             if candidate.is_empty() {
-                info!("Browser finished gathering ICE candidates");
+                debug!("Browser finished gathering ICE candidates");
             } else {
-                info!(sdp_mline_index, %candidate, "Remote ICE candidate");
+                debug!(sdp_mline_index, %candidate, "Remote ICE candidate");
                 webrtcbin.emit_by_name::<()>("add-ice-candidate", &[&sdp_mline_index, &candidate]);
             }
         }
         SignalMsg::Offer { .. } => bail!("unexpected SDP offer from browser; the broker is the offerer"),
+        SignalMsg::Error { .. } => bail!("unexpected error message from browser"),
     }
     Ok(())
 }
 
 /// Offer on negotiation-needed, trickle local candidates, and log state transitions.
+///
+/// These callbacks run on GStreamer threads, so each re-enters the session's tracing span.
 fn connect_webrtcbin_signals(webrtcbin: &gst::Element, events: &mpsc::UnboundedSender<PeerEvent>) {
     let tx = events.clone();
+    let span = Span::current();
     webrtcbin.connect_closure(
         "on-negotiation-needed",
         false,
         glib::closure!(move |webrtcbin: &gst::Element| {
+            let _span = span.enter();
             info!("webrtcbin needs negotiation; creating SDP offer");
             let tx = tx.clone();
             let element = webrtcbin.clone();
+            let span = span.clone();
             let promise = gst::Promise::with_change_func(move |reply| {
+                let _span = span.enter();
                 if let Err(err) = on_offer_created(&element, reply, &tx) {
                     let _ = tx.send(PeerEvent::Failed(format!("{err:#}")));
                 }
@@ -348,12 +491,14 @@ fn connect_webrtcbin_signals(webrtcbin: &gst::Element, events: &mpsc::UnboundedS
     );
 
     let tx = events.clone();
+    let span = Span::current();
     webrtcbin.connect_closure(
         "on-ice-candidate",
         false,
         glib::closure!(
             move |_webrtcbin: &gst::Element, sdp_mline_index: u32, candidate: &str| {
-                info!(sdp_mline_index, candidate, "Local ICE candidate");
+                let _span = span.enter();
+                debug!(sdp_mline_index, candidate, "Local ICE candidate");
                 let _ = tx.send(PeerEvent::Send(SignalMsg::Ice {
                     candidate: candidate.to_owned(),
                     sdp_mline_index,
@@ -362,18 +507,24 @@ fn connect_webrtcbin_signals(webrtcbin: &gst::Element, events: &mpsc::UnboundedS
         ),
     );
 
-    webrtcbin.connect_notify(Some("signaling-state"), |webrtcbin, _| {
+    let span = Span::current();
+    webrtcbin.connect_notify(Some("signaling-state"), move |webrtcbin, _| {
+        let _span = span.enter();
         let state = webrtcbin.property::<gst_webrtc::WebRTCSignalingState>("signaling-state");
         info!(?state, "WebRTC signaling state changed");
     });
 
-    webrtcbin.connect_notify(Some("ice-gathering-state"), |webrtcbin, _| {
+    let span = Span::current();
+    webrtcbin.connect_notify(Some("ice-gathering-state"), move |webrtcbin, _| {
+        let _span = span.enter();
         let state = webrtcbin.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
         info!(?state, "ICE gathering state changed");
     });
 
     let tx = events.clone();
+    let span = Span::current();
     webrtcbin.connect_notify(Some("ice-connection-state"), move |webrtcbin, _| {
+        let _span = span.enter();
         let state = webrtcbin.property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
         info!(?state, "ICE connection state changed");
         if state == gst_webrtc::WebRTCICEConnectionState::Failed {
@@ -382,7 +533,9 @@ fn connect_webrtcbin_signals(webrtcbin: &gst::Element, events: &mpsc::UnboundedS
     });
 
     let tx = events.clone();
+    let span = Span::current();
     webrtcbin.connect_notify(Some("connection-state"), move |webrtcbin, _| {
+        let _span = span.enter();
         let state = webrtcbin.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
         info!(?state, "Peer connection state changed");
         if state == gst_webrtc::WebRTCPeerConnectionState::Failed {
@@ -397,6 +550,7 @@ fn connect_input_channels(
     webrtcbin: &gst::Element,
     translator: &Arc<InputTranslator>,
     input: &mpsc::UnboundedSender<Vec<Operation>>,
+    counters: Option<&Arc<Session>>,
 ) -> anyhow::Result<gst_webrtc::WebRTCDataChannel> {
     let options = gst::Structure::builder("input-channel-options")
         .field("ordered", true)
@@ -406,24 +560,27 @@ fn connect_input_channels(
     let channel = webrtcbin
         .emit_by_name::<Option<gst_webrtc::WebRTCDataChannel>>("create-data-channel", &[&INPUT_CHANNEL_LABEL, &options])
         .context("webrtcbin did not create the input data channel")?;
-    info!(
+    debug!(
         label = INPUT_CHANNEL_LABEL,
         id = INPUT_CHANNEL_ID,
         "Created pre-negotiated input data channel"
     );
-    attach_input_channel(&channel, translator, input);
+    attach_input_channel(&channel, translator, input, counters);
 
     let translator = Arc::clone(translator);
     let input = input.clone();
+    let counters = counters.cloned();
+    let span = Span::current();
     webrtcbin.connect_closure(
         "on-data-channel",
         false,
         glib::closure!(
             move |_webrtcbin: &gst::Element, channel: &gst_webrtc::WebRTCDataChannel| {
+                let _span = span.enter();
                 let label = channel.label();
                 if label.as_deref() == Some(INPUT_CHANNEL_LABEL) {
                     info!(?label, "Browser opened an in-band input data channel");
-                    attach_input_channel(channel, &translator, &input);
+                    attach_input_channel(channel, &translator, &input, counters.as_ref());
                 } else {
                     warn!(?label, "Ignoring unexpected data channel from browser");
                 }
@@ -438,25 +595,44 @@ fn attach_input_channel(
     channel: &gst_webrtc::WebRTCDataChannel,
     translator: &Arc<InputTranslator>,
     input: &mpsc::UnboundedSender<Vec<Operation>>,
+    counters: Option<&Arc<Session>>,
 ) {
-    channel.connect_on_open(|channel| info!(label = ?channel.label(), "Input data channel open"));
-    channel.connect_on_close(|channel| info!(label = ?channel.label(), "Input data channel closed"));
-    channel.connect_on_error(|channel, err| {
+    let span = Span::current();
+    channel.connect_on_open(move |channel| {
+        let _span = span.enter();
+        info!(label = ?channel.label(), "Input data channel open");
+    });
+    let span = Span::current();
+    channel.connect_on_close(move |channel| {
+        let _span = span.enter();
+        info!(label = ?channel.label(), "Input data channel closed");
+    });
+    let span = Span::current();
+    channel.connect_on_error(move |channel, err| {
+        let _span = span.enter();
         warn!(label = ?channel.label(), error = %err, "Input data channel error");
     });
 
     let translator = Arc::clone(translator);
     let input = input.clone();
+    let counters = counters.cloned();
+    let span = Span::current();
     channel.connect_on_message_string(move |_channel, msg| {
         let Some(msg) = msg else {
             return;
         };
+        if let Some(session) = &counters {
+            session.add_sent(u64::try_from(msg.len()).unwrap_or(u64::MAX));
+        }
         match translator.translate(msg) {
             Ok(ops) if ops.is_empty() => {}
             Ok(ops) => {
                 let _ = input.send(ops);
             }
-            Err(err) => warn!(error = %format!("{err:#}"), msg_len = msg.len(), "Ignoring malformed input message"),
+            Err(err) => {
+                let _span = span.enter();
+                warn!(error = %format!("{err:#}"), msg_len = msg.len(), "Ignoring malformed input message");
+            }
         }
     });
 }

@@ -17,6 +17,8 @@ export function brokerUrl(path: string): string {
 
 export type BrokerSession = {
   id: string;
+  /** C: RDCleanPath relay (browser decode). B: broker-side decode streamed over WebRTC. */
+  mode: 'C' | 'B';
   dest: string;
   clientIp: string;
   startedAt: string;

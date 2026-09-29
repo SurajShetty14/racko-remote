@@ -12,6 +12,8 @@ pub struct Config {
     pub management_bind: SocketAddr,
     pub target_host: String,
     pub target_port: u16,
+    /// Every destination either mode may reach: `RDP_TARGET` plus `RDP_ALLOWED_TARGETS`.
+    pub allowed_targets: Vec<(String, u16)>,
     /// Lab VMs present a self-signed RDP certificate. `insecure` accepts it.
     pub tls_insecure: bool,
     /// Close a relay after this long with no bytes in either direction. Zero disables it.
@@ -36,6 +38,19 @@ impl Config {
             .context("RDP_TARGET is required (host:port of the lab VM). Set it in broker/.env")?;
         let (target_host, target_port) = split_host_port(&target)?;
 
+        let mut allowed_targets = vec![(target_host.clone(), target_port)];
+        for entry in lookup(&file, "RDP_ALLOWED_TARGETS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            let parsed = split_host_port(entry).with_context(|| format!("RDP_ALLOWED_TARGETS entry {entry:?}"))?;
+            if !allowed_targets.contains(&parsed) {
+                allowed_targets.push(parsed);
+            }
+        }
+
         let tls_mode = lookup(&file, "RDP_TLS_VERIFY").unwrap_or_else(|| "insecure".to_owned());
         let tls_insecure = match tls_mode.as_str() {
             "insecure" => true,
@@ -53,17 +68,25 @@ impl Config {
             management_bind,
             target_host,
             target_port,
+            allowed_targets,
             tls_insecure,
             idle_timeout: Duration::from_secs(idle_timeout_secs),
         })
     }
 
+    /// Allowed destinations as `host:port`, comma-separated, for logs.
     pub fn target_label(&self) -> String {
-        format!("{}:{}", self.target_host, self.target_port)
+        self.allowed_targets
+            .iter()
+            .map(|(host, port)| format!("{host}:{port}"))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     pub fn allows(&self, host: &str, port: u16) -> bool {
-        port == self.target_port && host.eq_ignore_ascii_case(&self.target_host)
+        self.allowed_targets
+            .iter()
+            .any(|(allowed_host, allowed_port)| port == *allowed_port && host.eq_ignore_ascii_case(allowed_host))
     }
 }
 

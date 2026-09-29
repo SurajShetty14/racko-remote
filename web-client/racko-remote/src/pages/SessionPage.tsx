@@ -17,7 +17,7 @@ import { clearConnectRequest, readConnectRequest, type ConnectRequest } from '..
 /** Delays before retries 1..5 after an unexpected socket drop. */
 const RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
 
-type LinkState = 'connecting' | 'connected' | 'reconnecting' | 'lost' | 'error';
+type LinkState = 'connecting' | 'connected' | 'reconnecting' | 'lost' | 'error' | 'taken-over';
 
 export function SessionPage() {
   const navigate = useNavigate();
@@ -198,14 +198,16 @@ export function SessionPage() {
               </div>
             </div>
           ) : null}
-          {link === 'lost' || link === 'error' ? (
+          {link === 'lost' || link === 'error' || link === 'taken-over' ? (
             <div className="reconnect-overlay">
               <div className="reconnect-card">
-                <h2>{link === 'error' ? 'Connection error' : 'Connection lost'}</h2>
+                <h2>{overlayTitle(link)}</h2>
                 <p>
                   {link === 'error'
                     ? 'The desktop stream could not be decoded. Reconnect when you are ready.'
-                    : 'The session could not be restored.'}
+                    : link === 'taken-over'
+                      ? 'Someone else signed in to this desktop. Reconnecting will disconnect them.'
+                      : 'The session could not be restored.'}
                 </p>
                 <button type="button" onClick={() => setGeneration((value) => value + 1)}>
                   Reconnect
@@ -233,6 +235,37 @@ function isGraphicsFailure(message: string): boolean {
   return /progressive|rfx|srl\(|decode failed|bitmap update|codec/i.test(message);
 }
 
+/**
+ * Server-sent disconnect reasons meaning another connection or an admin took the session.
+ * Retrying would just kick the other side (or get kicked again), so these are not retried.
+ * Matches the ironrdp-pdu `ProtocolIndependentCode` descriptions for
+ * DisconnectedByOtherconnection, RpcInitiatedLogoff and RpcInitiatedDisconnect.
+ */
+function isSessionTakeover(message: string): boolean {
+  return /another user connected to the server|forced logoff|on the server in another session/i.test(message);
+}
+
+function showTakeover(
+  setFailed: (failed: boolean) => void,
+  setLink: (link: LinkState) => void,
+  setStatus: (status: string) => void,
+): void {
+  setFailed(true);
+  setLink('taken-over');
+  setStatus('Session taken over by another connection');
+}
+
+function overlayTitle(link: LinkState): string {
+  switch (link) {
+    case 'error':
+      return 'Connection error';
+    case 'taken-over':
+      return 'Session taken over by another connection';
+    default:
+      return 'Connection lost';
+  }
+}
+
 function showGraphicsError(
   setFailed: (failed: boolean) => void,
   setLink: (link: LinkState) => void,
@@ -255,6 +288,8 @@ function linkLabel(link: LinkState): string {
       return 'Lost';
     case 'error':
       return 'Error';
+    case 'taken-over':
+      return 'Taken over';
   }
 }
 
@@ -321,6 +356,10 @@ async function runConnection(
           showGraphicsError(setFailed, setLink, setStatus);
           return;
         }
+        if (isSessionTakeover(info.reason())) {
+          showTakeover(setFailed, setLink, setStatus);
+          return;
+        }
         setStatus(info.reason());
       } catch (error) {
         if (signal.aborted || userLeft.current) {
@@ -329,6 +368,10 @@ async function runConnection(
         const message = errorMessage(error);
         if (isGraphicsFailure(message)) {
           showGraphicsError(setFailed, setLink, setStatus);
+          return;
+        }
+        if (isSessionTakeover(message)) {
+          showTakeover(setFailed, setLink, setStatus);
           return;
         }
         setStatus(message);

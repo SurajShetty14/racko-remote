@@ -1,4 +1,5 @@
 //! HTTP management API and Prometheus text exposition, separate from the relay.
+//! Also hosts the Mode B signaling route when the broker is built with it.
 
 use core::net::SocketAddr;
 use std::sync::Arc;
@@ -22,7 +23,8 @@ pub struct ApiState {
     pub metrics: PrometheusHandle,
 }
 
-pub async fn serve(addr: SocketAddr, state: ApiState) -> anyhow::Result<()> {
+/// `extra` is merged in as-is (Mode B signaling); handlers may extract `ConnectInfo<SocketAddr>`.
+pub async fn serve(addr: SocketAddr, state: ApiState, extra: Router) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let app = Router::new()
         .route("/api/sessions", get(list_sessions))
@@ -30,9 +32,10 @@ pub async fn serve(addr: SocketAddr, state: ApiState) -> anyhow::Result<()> {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state)
+        .merge(extra);
     tracing::info!(bind = %addr, "management API listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 

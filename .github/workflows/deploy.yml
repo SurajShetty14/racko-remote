@@ -30,8 +30,9 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
+      # Mode B (GStreamer/NVENC) needs the GStreamer dev packages on the box; see scripts/build-modeb-encode.sh.
       - name: Build broker
-        run: cargo build -p broker --release --locked
+        run: cargo build -p broker --release --locked --features modeb-encode
 
       - name: Build ironrdp-web
         run: |
@@ -62,6 +63,8 @@ jobs:
         env:
           VITE_GATEWAY_URL: ${{ secrets.VITE_GATEWAY_URL }}
           VITE_BROKER_API_BASE: ${{ secrets.VITE_BROKER_API_BASE }}
+          # Optional; unset derives wss://<domain>/modeb/webrtc from VITE_BROKER_API_BASE.
+          VITE_MODEB_SIGNALING_URL: ${{ secrets.VITE_MODEB_SIGNALING_URL }}
         run: |
           set -euo pipefail
           test -n "$VITE_GATEWAY_URL"
